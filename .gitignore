@@ -1,4 +1,5 @@
 build/
+checkpoints/
 dist/
 *.egg-info/
 **/__pycache__/
