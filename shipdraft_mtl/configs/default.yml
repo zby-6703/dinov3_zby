@@ -1,0 +1,190 @@
+Global:
+  device: gpu
+  epoch_num: 50
+  max_iter:  
+  log_smooth_window: 20
+  print_batch_step: 200
+  eval_epoch_step: [0, 1]
+  eval_batch_step: [100000000000, 1000]
+  save_epoch_step: [1000, 1]
+  save_iter_step: [100000000000, 2000]
+  output_dir: ./output/shipdraft_mtl/multitask_dinov3_convnext_tiny_256x640
+  checkpoints:
+  pretrained_model:
+  seed: 48
+  use_amp: True
+  accumulation_steps: 1
+  grad_clip_val: 0
+  use_sync_bn: False
+  use_tensorboard: False
+
+Optimizer:
+  name: AdamW
+  lr: 0.0001
+  weight_decay: 0.0001
+  filter_bias_and_bn: True
+  backbone_lr_mult: 0.1
+
+LRScheduler:
+  name: MultiStepLR
+  milestones: [180, 240]
+  gamma: 0.1
+  warmup_epoch: 0
+
+Architecture:
+  name: DraftFormerModel
+  model_type: multitask
+  in_channels: 3
+  # DINOv3 uses RGB ImageNet normalization. Values are scaled to this
+  # dataset's 0-255 float image tensors.
+  pixel_mean: [123.675, 116.280, 103.530]
+  pixel_std: [58.395, 57.120, 57.375]
+
+  Backbone:
+    # Local Hugging Face checkpoint: checkpoints/dinov3-convnext-tiny-pretrain-lvd1689m
+    name: DINOv3ConvNeXtBackbone
+    model_name: dinov3_convnext_tiny
+    source: huggingface
+    repo_or_dir: checkpoints/dinov3-convnext-tiny-pretrain-lvd1689m
+    local_files_only: True
+    trust_remote_code: False
+    pretrained: True
+    freeze_at: 0
+    out_features: [res2, res3, res4, res5]
+
+  Encoder:
+    name: HybridEncoder
+    in_features: [res2, res3, res4, res5]
+    transformer_in_features: [res3, res4, res5]
+    hidden_dim: 256
+    mask_dim: 256
+    norm: GN
+    dim_feedforward: 1024
+    dropout: 0.0
+    nhead: 8
+    num_encoder_layers: 1
+    common_stride: 4
+    num_feature_levels: 3
+    total_num_feature_levels: 3
+    feature_order: high2low
+    hybrid:
+      use_encoder_idx: [2]
+      pe_temperature: 10000.0
+      expansion: 1.0
+      depth_mult: 1.0
+      act: silu
+      enc_act: gelu
+
+  Decoder:
+    name: DraftFormerDecoder
+    hidden_dim: 256
+    num_queries: 140
+    num_detection_queries: 100
+    nheads: 8
+    dim_feedforward: 2048
+    dec_layers: 6
+    enforce_input_project: False
+    two_stage: True
+    initialize_box_type: "no"
+    initial_pred: True
+    learn_tgt: False
+    total_num_feature_levels: 3
+    dropout: 0.0
+    activation: relu
+    dec_n_points: 4
+    query_dim: 4
+    dec_layer_share: False
+    use_task_embedding: True
+    task_embedding_scale: 1.0
+
+  Head:
+    name: DraftFormerPredictionHead
+    hidden_dim: 256
+    mask_dim: 256
+    num_classes: 9
+    num_classes_seg: 1
+    num_detection_queries: 100
+    semantic_ce_loss: False
+    deep_supervision: True
+
+Loss:
+  name: DraftFormerLoss
+  losses: [labels, masks, boxes]
+  no_object_weight: 0.1
+  class_weight: 4.0
+  mask_weight: 5.0
+  dice_weight: 5.0
+  box_weight: 5.0
+  giou_weight: 2.0
+  num_points: 12544
+  oversample_ratio: 3.0
+  importance_sample_ratio: 0.75
+  matcher_det:
+    cost_class: 4.0
+    cost_box: 5.0
+    cost_giou: 2.0
+  matcher_seg:
+    cost_class: 4.0
+    cost_mask: 5.0
+    cost_dice: 5.0
+  task_balancer:
+    enabled: False
+    method: uncertainty
+    initial_log_var: 0.0
+    alpha: 1.5
+    update_frequency: 10
+    initial_weight: 1.0
+    temperature: 2.0
+    window_size: 20
+
+PostProcess:
+  name: DraftFormerPostProcess
+  score_thresh: 0.1
+  topk: 80
+  nms_type: class_aware
+  nms_thresh: 0.5
+
+Metric:
+  name: DraftFormerMetric
+  main_indicator: hybrid_score
+  hybrid_det_metric: mAP@0.5
+  hybrid_seg_metric: water_iou
+  hybrid_det_weight: 0.5
+  hybrid_seg_weight: 0.5
+  det_class_names: ["0", "1", "2", "3", "4", "5", "6", "8", "M"]
+
+Input:
+  format: RGB
+  image_size: [256, 640]
+
+Train:
+  dataset:
+    name: JsonMultitaskDataset
+    data_root: E:\data\PingLuRiver\dataset\ShipDraft
+    split: train
+    image_format: RGB
+    image_size: [256, 640]
+    pad_value: 0
+    filter_empty: True
+  loader:
+    batch_size_per_card: 8
+    shuffle: True
+    drop_last: False
+    num_workers: 4
+    pin_memory: True
+
+Eval:
+  dataset:
+    name: JsonMultitaskDataset
+    data_root: E:\data\PingLuRiver\dataset\ShipDraft
+    split: val
+    image_format: RGB
+    image_size: [256, 640]
+    pad_value: 0
+    filter_empty: False
+  loader:
+    batch_size_per_card: 8
+    shuffle: False
+    drop_last: False
+    num_workers: 4
+    pin_memory: True

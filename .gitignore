@@ -1,6 +1,7 @@
 build/
 checkpoints/
 dist/
+outputs/
 *.egg-info/
 **/__pycache__/
 

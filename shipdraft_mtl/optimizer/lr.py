@@ -1,0 +1,167 @@
+import math
+from functools import partial
+
+from torch.optim import lr_scheduler
+
+
+class StepLR(object):
+    def __init__(self, step_each_epoch, step_size, warmup_epoch=0, gamma=0.1, last_epoch=-1, **kwargs):
+        self.step_size = step_each_epoch * step_size
+        self.gamma = gamma
+        self.last_epoch = last_epoch
+        self.warmup_epoch = warmup_epoch * step_each_epoch
+
+    def __call__(self, optimizer):
+        return lr_scheduler.LambdaLR(optimizer, self.lambda_func, self.last_epoch)
+
+    def lambda_func(self, current_step):
+        if current_step < self.warmup_epoch:
+            return float(current_step) / float(max(1, self.warmup_epoch))
+        return self.gamma ** (current_step // self.step_size)
+
+
+class MultiStepLR(object):
+    def __init__(self, step_each_epoch, milestones, warmup_epoch=0, gamma=0.1, last_epoch=-1, **kwargs):
+        self.milestones = [step_each_epoch * epoch for epoch in milestones]
+        self.gamma = gamma
+        self.last_epoch = last_epoch
+        self.warmup_epoch = warmup_epoch * step_each_epoch
+
+    def __call__(self, optimizer):
+        return lr_scheduler.LambdaLR(optimizer, self.lambda_func, self.last_epoch)
+
+    def lambda_func(self, current_step):
+        if current_step < self.warmup_epoch:
+            return float(current_step) / float(max(1, self.warmup_epoch))
+        return self.gamma ** len([m for m in self.milestones if m <= current_step])
+
+
+class ConstLR(object):
+    def __init__(self, step_each_epoch, warmup_epoch=0, last_epoch=-1, **kwargs):
+        self.last_epoch = last_epoch
+        self.warmup_epoch = warmup_epoch * step_each_epoch
+
+    def __call__(self, optimizer):
+        return lr_scheduler.LambdaLR(optimizer, self.lambda_func, self.last_epoch)
+
+    def lambda_func(self, current_step):
+        if current_step < self.warmup_epoch:
+            return float(current_step) / float(max(1, self.warmup_epoch))
+        return 1.0
+
+
+class LinearLR(object):
+    def __init__(self, epochs, step_each_epoch, warmup_epoch=0, last_epoch=-1, **kwargs):
+        self.epochs = epochs * step_each_epoch
+        self.last_epoch = last_epoch
+        self.warmup_epoch = warmup_epoch * step_each_epoch
+
+    def __call__(self, optimizer):
+        return lr_scheduler.LambdaLR(optimizer, self.lambda_func, self.last_epoch)
+
+    def lambda_func(self, current_step):
+        if current_step < self.warmup_epoch:
+            return float(current_step) / float(max(1, self.warmup_epoch))
+        return max(
+            0.0,
+            float(self.epochs - current_step) / float(max(1, self.epochs - self.warmup_epoch)),
+        )
+
+
+class CosineAnnealingLR(object):
+    def __init__(self, epochs, step_each_epoch, warmup_epoch=0, last_epoch=-1, **kwargs):
+        self.epochs = epochs * step_each_epoch
+        self.last_epoch = last_epoch
+        self.warmup_epoch = warmup_epoch * step_each_epoch
+
+    def __call__(self, optimizer):
+        return lr_scheduler.LambdaLR(optimizer, self.lambda_func, self.last_epoch)
+
+    def lambda_func(self, current_step, num_cycles=0.5):
+        if current_step < self.warmup_epoch:
+            return float(current_step) / float(max(1, self.warmup_epoch))
+        progress = float(current_step - self.warmup_epoch) / float(
+            max(1, self.epochs - self.warmup_epoch)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+
+class OneCycleLR(object):
+    def __init__(self, epochs, step_each_epoch, last_epoch=-1, lr=0.001, warmup_epoch=1.0, cycle_momentum=True, **kwargs):
+        self.epochs = epochs
+        self.last_epoch = last_epoch
+        self.step_each_epoch = step_each_epoch
+        self.lr = lr
+        self.pct_start = warmup_epoch / epochs
+        self.cycle_momentum = cycle_momentum
+
+    def __call__(self, optimizer):
+        return lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.lr,
+            total_steps=self.epochs * self.step_each_epoch,
+            pct_start=self.pct_start,
+            cycle_momentum=self.cycle_momentum,
+        )
+
+
+class PolynomialLR(object):
+    def __init__(self, step_each_epoch, epochs, lr_end=1e-7, power=1.0, warmup_epoch=0, last_epoch=-1, **kwargs):
+        self.lr_end = lr_end
+        self.power = power
+        self.epochs = epochs * step_each_epoch
+        self.warmup_epoch = warmup_epoch * step_each_epoch
+        self.last_epoch = last_epoch
+
+    def __call__(self, optimizer):
+        lr_lambda = partial(self.lambda_func, lr_init=optimizer.defaults["lr"])
+        return lr_scheduler.LambdaLR(optimizer, lr_lambda, self.last_epoch)
+
+    def lambda_func(self, current_step, lr_init):
+        if current_step < self.warmup_epoch:
+            return float(current_step) / float(max(1, self.warmup_epoch))
+        if current_step > self.epochs:
+            return self.lr_end / lr_init
+        lr_range = lr_init - self.lr_end
+        decay_steps = self.epochs - self.warmup_epoch
+        pct_remaining = 1 - (current_step - self.warmup_epoch) / decay_steps
+        decay = lr_range * pct_remaining ** self.power + self.lr_end
+        return decay / lr_init
+
+
+class WarmupCosineLR(object):
+    def __init__(self, epochs, step_each_epoch, warmup_steps=0, eta_min=0.0, last_epoch=-1, **kwargs):
+        self.total_steps = epochs * step_each_epoch
+        self.warmup_steps = warmup_steps
+        self.eta_min = eta_min
+        self.last_epoch = last_epoch
+
+    def __call__(self, optimizer):
+        schedulers = []
+        milestones = []
+        if self.warmup_steps > 0:
+            schedulers.append(
+                lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=1e-7,
+                    end_factor=1.0,
+                    total_iters=self.warmup_steps,
+                )
+            )
+            milestones.append(self.warmup_steps)
+
+        schedulers.append(
+            lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, self.total_steps - self.warmup_steps),
+                eta_min=self.eta_min,
+            )
+        )
+        if len(schedulers) == 1:
+            return schedulers[0]
+        return lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=schedulers,
+            milestones=milestones,
+            last_epoch=self.last_epoch,
+        )
