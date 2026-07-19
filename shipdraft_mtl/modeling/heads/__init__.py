@@ -3,7 +3,6 @@ from importlib import import_module
 
 __all__ = ["build_head"]
 
-
 name_to_module = {
     "DraftFormerPredictionHead": ".draftformer_prediction_head",
 }

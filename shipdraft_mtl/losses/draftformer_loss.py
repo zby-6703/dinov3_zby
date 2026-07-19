@@ -446,23 +446,22 @@ class SetCriterion(nn.Module):
                 losses.update({k + '_det': v for k, v in l_dict.items()})
 
         # ════════════════════════════════════════════════════════
-        # 4. 计算分割任务损失
+        # 4. 计算分割任务损失（点分割 e2e 无 seg query 时跳过）
         # ════════════════════════════════════════════════════════
-        # 使用分割任务专用的匹配器
-        # 分割任务只使用 cls + mask 进行匹配，不使用box
-        # 因为分割任务的box是从多边形计算得到的粗略bbox，不应该用于匹配
-        indices_seg = self.matcher_seg(outputs_seg, targets_seg, cost=["cls", "mask"])
-        num_masks_seg = sum(len(t["labels"]) for t in targets_seg)
-        num_masks_seg = torch.as_tensor([num_masks_seg], dtype=torch.float, device=next(iter(outputs.values())).device)
-        if is_dist_avail_and_initialized():
-            torch.distributed.all_reduce(num_masks_seg)
-        num_masks_seg = torch.clamp(num_masks_seg / get_world_size(), min=1).item()
-        
-        # 分割任务只计算 'labels' 和 'masks' 损失（没有box loss）
-        for loss in ['labels', 'masks']:
-            if loss in self.losses:
-                l_dict = self.get_loss(loss, outputs_seg, targets_seg, indices_seg, num_masks_seg, task='seg')
-                losses.update({k + '_seg': v for k, v in l_dict.items()})
+        nq = outputs_without_aux["pred_logits"].shape[1]
+        has_seg = (self.num_classes_seg > 0) and (k < nq) and (outputs_seg["pred_logits"].shape[1] > 0)
+        num_masks_seg = 1.0
+        if has_seg:
+            indices_seg = self.matcher_seg(outputs_seg, targets_seg, cost=["cls", "mask"])
+            num_masks_seg = sum(len(t["labels"]) for t in targets_seg)
+            num_masks_seg = torch.as_tensor([num_masks_seg], dtype=torch.float, device=next(iter(outputs.values())).device)
+            if is_dist_avail_and_initialized():
+                torch.distributed.all_reduce(num_masks_seg)
+            num_masks_seg = torch.clamp(num_masks_seg / get_world_size(), min=1).item()
+            for loss in ["labels", "masks"]:
+                if loss in self.losses:
+                    l_dict = self.get_loss(loss, outputs_seg, targets_seg, indices_seg, num_masks_seg, task="seg")
+                    losses.update({k + "_seg": v for k, v in l_dict.items()})
 
         # ════════════════════════════════════════════════════════
         # 5. 计算辅助层损失 (Auxiliary outputs)
@@ -491,13 +490,13 @@ class SetCriterion(nn.Module):
                         l_dict = self.get_loss(loss, aux_outputs_det, targets_det, indices_det_aux, num_masks_det, task='det')
                         losses.update({k + f'_det_{i}': v for k, v in l_dict.items()})
 
-                # 分割辅助损失
-                # 辅助层也只使用 cls + mask 匹配
-                indices_seg_aux = self.matcher_seg(aux_outputs_seg, targets_seg, cost=["cls", "mask"])
-                for loss in ['labels', 'masks']:
-                    if loss in self.losses:
-                        l_dict = self.get_loss(loss, aux_outputs_seg, targets_seg, indices_seg_aux, num_masks_seg, task='seg')
-                        losses.update({k + f'_seg_{i}': v for k, v in l_dict.items()})
+                # 分割辅助损失（无 seg query 时跳过）
+                if has_seg:
+                    indices_seg_aux = self.matcher_seg(aux_outputs_seg, targets_seg, cost=["cls", "mask"])
+                    for loss in ["labels", "masks"]:
+                        if loss in self.losses:
+                            l_dict = self.get_loss(loss, aux_outputs_seg, targets_seg, indices_seg_aux, num_masks_seg, task="seg")
+                            losses.update({k + f"_seg_{i}": v for k, v in l_dict.items()})
                 
         # ════════════════════════════════════════════════════════
         # 6.计算 Contrastive Denoising Training 损失

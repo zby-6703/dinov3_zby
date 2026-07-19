@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
-
 import torch
 import torch.nn.functional as F
-from torchvision.ops import batched_nms, nms
 
 from shipdraft_mtl.utils.box_ops import box_cxcywh_to_xyxy
 
@@ -19,6 +16,8 @@ class DraftFormerPostProcess:
         num_seg_classes: int = 1,
         nms_thresh: float = 0.5,
         nms_type: str = "class_aware",
+        point_mode: bool = False,
+        point_nms_dist: float = 0.03,
     ):
         self.score_thresh = score_thresh
         self.topk = topk
@@ -27,121 +26,128 @@ class DraftFormerPostProcess:
         self.num_seg_classes = num_seg_classes
         self.nms_thresh = nms_thresh
         self.nms_type = nms_type.lower()
+        self.point_mode = bool(point_mode)
+        self.point_nms_dist = float(point_nms_dist)
 
-    def __call__(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        image_sizes: List[Tuple[int, int]],
-        batched_inputs: List[Dict],
-    ) -> List[Dict[str, torch.Tensor]]:
-        pred_logits = outputs["pred_logits"]
-        pred_boxes = outputs["pred_boxes"]
-        pred_masks = outputs["pred_masks"]
+    def __call__(self, outputs, image_sizes, batched_inputs):
+        pred_logits = outputs.get("pred_logits")
+        pred_boxes = outputs.get("pred_boxes")
+        pred_masks = outputs.get("pred_masks")
         results = []
-
         for batch_idx, ((height, width), sample) in enumerate(zip(image_sizes, batched_inputs)):
-            det_logits = pred_logits[batch_idx, : self.num_detection_queries, : self.num_det_classes]
-            det_boxes = pred_boxes[batch_idx, : self.num_detection_queries]
-            seg_logits = pred_logits[batch_idx, self.num_detection_queries :, : self.num_seg_classes]
-            seg_masks = pred_masks[batch_idx, self.num_detection_queries :]
-
-            boxes, scores, labels = self._decode_detections(det_logits, det_boxes, width, height, sample)
-            sem_seg = self._decode_segmentation(seg_logits, seg_masks, width, height, sample)
-            results.append(
-                {
-                    "boxes": boxes,
-                    "scores": scores,
-                    "labels": labels,
-                    "sem_seg": sem_seg,
-                    "image_size": (sample.get("orig_height", height), sample.get("orig_width", width)),
-                }
-            )
-
+            if pred_logits is not None and pred_boxes is not None:
+                det_logits = pred_logits[batch_idx, : self.num_detection_queries, : self.num_det_classes]
+                det_boxes = pred_boxes[batch_idx, : self.num_detection_queries]
+                points, scores, labels = self._decode_points(det_logits, det_boxes, width, height, sample)
+                boxes = self._points_to_tiny_boxes(points) if self.point_mode else self._decode_boxes_fallback(det_logits, det_boxes, width, height, sample)[0]
+            else:
+                device = outputs["pred_depth"].device
+                det_logits = None
+                points = torch.zeros(0, 2, device=device)
+                scores = torch.zeros(0, device=device)
+                labels = torch.zeros(0, dtype=torch.int64, device=device)
+                boxes = torch.zeros(0, 4, device=device)
+            result = {
+                "points": points,
+                "scores": scores,
+                "labels": labels,
+                "boxes": boxes,
+                "image_size": (sample.get("orig_height", height), sample.get("orig_width", width)),
+            }
+            if pred_masks is not None and self.num_seg_classes > 0 and pred_logits is not None and pred_logits.shape[1] > self.num_detection_queries:
+                seg_logits = pred_logits[batch_idx, self.num_detection_queries :, : max(self.num_seg_classes, 1)]
+                seg_masks = pred_masks[batch_idx, self.num_detection_queries :]
+                result["sem_seg"] = self._decode_segmentation(seg_logits, seg_masks, width, height, sample)
+            else:
+                result["sem_seg"] = torch.zeros(1, sample.get("orig_height", height), sample.get("orig_width", width), device=points.device)
+            if "pred_depth" in outputs:
+                result["draft_depth"] = outputs["pred_depth"][batch_idx].detach()
+                result["draft_valid"] = torch.sigmoid(outputs["pred_depth_valid_logits"][batch_idx]).detach()
+            results.append(result)
         return results
 
-    def _decode_detections(self, logits, boxes, width, height, sample):
+    def _decode_points(self, logits, boxes, width, height, sample):
         prob = logits.sigmoid()
-        flat_scores = prob.flatten()
-        numel = flat_scores.numel()
-        if numel == 0:
-            return (
-                torch.zeros((0, 4), device=boxes.device),
-                torch.zeros((0,), device=boxes.device),
-                torch.zeros((0,), dtype=torch.int64, device=boxes.device),
-            )
+        scores, labels = prob.max(dim=-1)
+        keep = scores > self.score_thresh
+        scores, labels, boxes = scores[keep], labels[keep], boxes[keep]
+        if scores.numel() == 0:
+            dev = logits.device
+            return torch.zeros(0, 2, device=dev), torch.zeros(0, device=dev), torch.zeros(0, dtype=torch.int64, device=dev)
+        # topk
+        if scores.numel() > self.topk:
+            scores, idx = scores.topk(self.topk)
+            labels = labels[idx]
+            boxes = boxes[idx]
+        points = boxes[:, :2] * torch.tensor([width, height], device=boxes.device)
+        points = self._restore_points_from_padding(points, sample)
+        # simple distance nms in original coords
+        if self.point_mode and len(scores) > 1:
+            order = scores.argsort(descending=True)
+            keep_idx = []
+            suppressed = torch.zeros(len(order), dtype=torch.bool, device=scores.device)
+            pts = points[order]
+            oh = float(sample.get("orig_height", height))
+            ow = float(sample.get("orig_width", width))
+            thr = self.point_nms_dist * max(oh, ow)
+            for i in range(len(order)):
+                if suppressed[i]:
+                    continue
+                keep_idx.append(order[i].item())
+                if i + 1 < len(order):
+                    d = torch.norm(pts[i + 1 :] - pts[i], dim=-1)
+                    suppressed[i + 1 :] |= d < thr
+            keep_idx = torch.tensor(keep_idx, device=scores.device, dtype=torch.long)
+            points, scores, labels = points[keep_idx], scores[keep_idx], labels[keep_idx]
+        return points, scores, labels
 
-        topk = min(self.topk, numel)
-        scores, topk_indices = flat_scores.topk(topk, sorted=True)
+    def _points_to_tiny_boxes(self, points):
+        if len(points) == 0:
+            return torch.zeros(0, 4, device=points.device)
+        r = 3.0
+        return torch.stack([points[:, 0] - r, points[:, 1] - r, points[:, 0] + r, points[:, 1] + r], dim=-1)
+
+    def _decode_boxes_fallback(self, logits, boxes, width, height, sample):
+        # legacy path for non-point mode
+        prob = logits.sigmoid()
+        flat = prob.flatten()
+        topk = min(self.topk, flat.numel())
+        scores, topk_indices = flat.topk(topk)
         labels = topk_indices % self.num_det_classes
         query_indices = topk_indices // self.num_det_classes
         keep = scores > self.score_thresh
-        scores = scores[keep]
-        labels = labels[keep]
-        query_indices = query_indices[keep]
+        scores, labels, query_indices = scores[keep], labels[keep], query_indices[keep]
         boxes = boxes[query_indices]
-
-        boxes_xyxy = box_cxcywh_to_xyxy(boxes)
-        boxes_xyxy = boxes_xyxy * torch.tensor([width, height, width, height], device=boxes.device)
+        boxes_xyxy = box_cxcywh_to_xyxy(boxes) * torch.tensor([width, height, width, height], device=boxes.device)
         boxes_xyxy = self._restore_boxes_from_padding(boxes_xyxy, sample)
-
-        if len(scores) > 0 and self.nms_type != "none" and self.nms_thresh is not None and self.nms_thresh > 0:
-            if self.nms_type == "class_aware":
-                keep = batched_nms(boxes_xyxy, scores, labels, self.nms_thresh)
-            elif self.nms_type == "class_agnostic":
-                keep = nms(boxes_xyxy, scores, self.nms_thresh)
-            else:
-                raise ValueError(f"Unsupported nms_type: {self.nms_type}")
-            boxes_xyxy = boxes_xyxy[keep]
-            scores = scores[keep]
-            labels = labels[keep]
         return boxes_xyxy, scores, labels
 
     def _decode_segmentation(self, logits, masks, width, height, sample):
         orig_h = sample.get("orig_height", height)
         orig_w = sample.get("orig_width", width)
         if masks.numel() == 0:
-            return torch.zeros((self.num_seg_classes, orig_h, orig_w), device=logits.device)
+            return torch.zeros(1, orig_h, orig_w, device=logits.device)
+        prob = logits.sigmoid().reshape(-1, 1, 1) * masks.sigmoid()
+        sem = prob.max(dim=0).values
+        if sem.ndim == 2:
+            sem = sem.unsqueeze(0)
+        sem = F.interpolate(sem.unsqueeze(0), size=(orig_h, orig_w), mode="bilinear", align_corners=False)[0]
+        return sem
 
-        upsampled_masks = F.interpolate(
-            masks.unsqueeze(0),
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-        sem_seg = torch.einsum("qc,qhw->chw", logits.sigmoid(), upsampled_masks.sigmoid())
-        return self._restore_segmentation_from_padding(sem_seg, sample)
+    def _restore_points_from_padding(self, points, sample):
+        scale = float(sample.get("resize_scale", 1.0)) or 1.0
+        pad_left = float(sample.get("pad_left", 0))
+        pad_top = float(sample.get("pad_top", 0))
+        pts = points.clone()
+        pts[:, 0] = (pts[:, 0] - pad_left) / scale
+        pts[:, 1] = (pts[:, 1] - pad_top) / scale
+        return pts
 
-    def _restore_boxes_from_padding(self, boxes_xyxy, sample):
-        orig_h = sample.get("orig_height", sample.get("height"))
-        orig_w = sample.get("orig_width", sample.get("width"))
-        scale = sample.get("resize_scale", 1.0)
-        pad_left = sample.get("pad_left", 0)
-        pad_top = sample.get("pad_top", 0)
-        boxes_xyxy[:, 0::2] = (boxes_xyxy[:, 0::2] - pad_left) / scale
-        boxes_xyxy[:, 1::2] = (boxes_xyxy[:, 1::2] - pad_top) / scale
-        boxes_xyxy[:, 0::2] = boxes_xyxy[:, 0::2].clamp(min=0, max=orig_w)
-        boxes_xyxy[:, 1::2] = boxes_xyxy[:, 1::2].clamp(min=0, max=orig_h)
-        return boxes_xyxy
-
-    def _restore_segmentation_from_padding(self, sem_seg, sample):
-        orig_h = sample.get("orig_height", sample.get("height"))
-        orig_w = sample.get("orig_width", sample.get("width"))
-        target_h = sample.get("height")
-        target_w = sample.get("width")
-        pad_left = sample.get("pad_left", 0)
-        pad_top = sample.get("pad_top", 0)
-        pad_right = sample.get("pad_right", 0)
-        pad_bottom = sample.get("pad_bottom", 0)
-
-        h_start = pad_top
-        h_end = target_h - pad_bottom
-        w_start = pad_left
-        w_end = target_w - pad_right
-        sem_seg = sem_seg[:, h_start:h_end, w_start:w_end]
-        sem_seg = F.interpolate(
-            sem_seg.unsqueeze(0),
-            size=(orig_h, orig_w),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-        return sem_seg
+    def _restore_boxes_from_padding(self, boxes, sample):
+        scale = float(sample.get("resize_scale", 1.0)) or 1.0
+        pad_left = float(sample.get("pad_left", 0))
+        pad_top = float(sample.get("pad_top", 0))
+        out = boxes.clone()
+        out[:, [0, 2]] = (out[:, [0, 2]] - pad_left) / scale
+        out[:, [1, 3]] = (out[:, [1, 3]] - pad_top) / scale
+        return out

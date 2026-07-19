@@ -31,11 +31,11 @@ class DraftFormerPredictionHead(nn.Module):
 
         if semantic_ce_loss:
             self.class_embed_det = nn.Linear(hidden_dim, num_classes + 1)
-            self.class_embed_seg = nn.Linear(hidden_dim, num_classes_seg + 1)
+            self.class_embed_seg = nn.Linear(hidden_dim, max(num_classes_seg, 0) + 1) if num_classes_seg > 0 else None
         else:
             self.class_embed_det = nn.Linear(hidden_dim, num_classes)
-            self.class_embed_seg = nn.Linear(hidden_dim, num_classes_seg)
-        self.mask_embed_seg = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+            self.class_embed_seg = nn.Linear(hidden_dim, num_classes_seg) if num_classes_seg > 0 else None
+        self.mask_embed_seg = MLP(hidden_dim, hidden_dim, mask_dim, 3) if num_classes_seg > 0 else None
 
         bbox_heads = [MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_decoder_layers)]
         for module in bbox_heads:
@@ -122,7 +122,7 @@ class DraftFormerPredictionHead(nn.Module):
         decoder_output_seg = decoder_output[:, det_total:, :]
 
         outputs_class_det = self.class_embed_det(decoder_output_det)
-        if decoder_output_seg.shape[1] > 0:
+        if decoder_output_seg.shape[1] > 0 and self.class_embed_seg is not None:
             outputs_class_seg = self.class_embed_seg(decoder_output_seg)
             num_cls_det = outputs_class_det.shape[-1]
             num_cls_seg = outputs_class_seg.shape[-1]
@@ -146,7 +146,7 @@ class DraftFormerPredictionHead(nn.Module):
                 device=mask_features.device,
                 dtype=mask_features.dtype,
             )
-            if decoder_output_seg.shape[1] > 0:
+            if decoder_output_seg.shape[1] > 0 and self.mask_embed_seg is not None:
                 mask_embed_seg = self.mask_embed_seg(decoder_output_seg)
                 seg_masks = torch.einsum("bqc,bchw->bqhw", mask_embed_seg, mask_features)
                 outputs_mask = torch.cat([det_masks, seg_masks], dim=1)

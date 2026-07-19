@@ -21,4 +21,11 @@ def build_post_process(config, architecture_config):
     config.setdefault("num_detection_queries", decoder_cfg["num_detection_queries"])
     config.setdefault("num_det_classes", head_cfg["num_classes"])
     config.setdefault("num_seg_classes", head_cfg.get("num_classes_seg", 1))
+    config.setdefault(
+        "point_mode",
+        architecture_config.get(
+            "point_mode",
+            architecture_config.get("model_type") in {"point_seg_e2e", "point_seg", "e2e_point"},
+        ),
+    )
     return module_class(**config)
