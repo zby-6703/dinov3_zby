@@ -35,7 +35,6 @@ Architecture:
   name: DraftFormerModel
   model_type: direct_depth_mtl
   point_mode: True
-  auxiliary_inference: False
   in_channels: 3
   pixel_mean: [123.675, 116.280, 103.530]
   pixel_std: [58.395, 57.120, 57.375]
@@ -174,7 +173,7 @@ Metric:
   hybrid_det_weight: 0.0
   hybrid_seg_weight: 0.0
   hybrid_draft_weight: 1.0
-  evaluate_auxiliary: False
+  evaluate_auxiliary: True
   point_mode: True
   pck_threshold: 0.05
   det_class_names: ["0", "1", "2", "3", "4", "5", "6", "8", "M", "waterline"]

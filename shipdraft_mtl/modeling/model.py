@@ -38,7 +38,6 @@ class DraftFormerModel(nn.Module):
         waterline_heatmap_head=None,
         waterline_heatmap_loss=None,
         point_mode=False,
-        auxiliary_inference=False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -53,7 +52,6 @@ class DraftFormerModel(nn.Module):
         self.waterline_heatmap_head = waterline_heatmap_head
         self.waterline_heatmap_loss = waterline_heatmap_loss
         self.point_mode = bool(point_mode)
-        self.auxiliary_inference = bool(auxiliary_inference)
         self.register_buffer("pixel_mean", torch.tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.tensor(pixel_std).view(-1, 1, 1), False)
 
@@ -144,19 +142,23 @@ class DraftFormerModel(nn.Module):
         images, image_sizes = self.preprocess_image(batched_inputs)
         features = self.backbone(images)
         encoded = self.encoder(features)
+        decoded = self.decoder(
+            encoded["multi_scale_features"],
+            proposal_class_head=self.head.get_proposal_class_head(),
+            proposal_box_head=self.head.get_proposal_box_head(),
+            bbox_refine_heads=self.head.get_bbox_refine_heads(),
+        )
+        outputs = self.head(decoded, encoded["mask_features"], self.decoder)
+        outputs["pred_points"] = outputs["pred_boxes"][..., :2]
+
         if self.direct_depth_head is not None:
-            outputs = self.direct_depth_head(encoded["mask_features"])
-        else:
-            outputs = {}
-        if self.training or self.auxiliary_inference:
-            decoded = self.decoder(
-                encoded["multi_scale_features"],
-                proposal_class_head=self.head.get_proposal_class_head(),
-                proposal_box_head=self.head.get_proposal_box_head(),
-                bbox_refine_heads=self.head.get_bbox_refine_heads(),
+            outputs.update(
+                self.direct_depth_head(
+                    outputs["decoder_hidden_states"],
+                    outputs["pred_points"],
+                    outputs["pred_logits"],
+                )
             )
-            outputs.update(self.head(decoded, encoded["mask_features"], self.decoder))
-            outputs["pred_points"] = outputs["pred_boxes"][..., :2]
 
         if self.training and self.waterline_heatmap_head is not None:
             outputs["pred_waterline_heatmap_logits"] = self.waterline_heatmap_head(encoded["mask_features"])
@@ -250,7 +252,16 @@ def build_model(cfg):
     depth_cfg = arch_cfg.get("DirectDepth") or cfg.get("DirectDepth")
     if not depth_cfg or not depth_cfg.get("enabled", True):
         raise ValueError("DirectDepth must be enabled for the ROI-to-draft model")
-    direct_depth_head = build_direct_depth_head(depth_cfg, in_channels=encoder.hidden_dim)
+    class_names = list(cfg.get("Data", {}).get("detection_classes", []))
+    if not class_names:
+        class_names = list(cfg.get("Metric", {}).get("det_class_names", []))
+    waterline_class_id = class_names.index("waterline") if "waterline" in class_names else arch_cfg["Head"].get("num_classes", 1) - 1
+    direct_depth_head = build_direct_depth_head(
+        depth_cfg,
+        query_dim=encoder.hidden_dim,
+        num_classes=arch_cfg["Head"].get("num_classes", len(class_names) or 10),
+        waterline_class_id=waterline_class_id,
+    )
     direct_depth_loss = build_direct_depth_loss(
         cfg.get("DirectDepthLoss") or depth_cfg.get("loss") or {}
     )
@@ -287,5 +298,4 @@ def build_model(cfg):
         waterline_heatmap_head=waterline_heatmap_head,
         waterline_heatmap_loss=waterline_heatmap_loss,
         point_mode=point_mode,
-        auxiliary_inference=arch_cfg.get("auxiliary_inference", False),
     )
