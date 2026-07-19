@@ -1,6 +1,6 @@
 Global:
   device: gpu
-  epoch_num: 50
+  epoch_num: 200
   max_iter:  
   log_smooth_window: 20
   print_batch_step: 200
@@ -8,7 +8,7 @@ Global:
   eval_batch_step: [100000000000, 1000]
   save_epoch_step: [1000, 1]
   save_iter_step: [100000000000, 2000]
-  output_dir: ./output/shipdraft_mtl/multitask_dinov3_convnext_tiny_256x640
+  output_dir: ./outputs/shipdraft_mtl/multitask_dinov3_convnext_tiny_256x640
   checkpoints:
   pretrained_model:
   seed: 48
