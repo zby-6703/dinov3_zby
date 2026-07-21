@@ -131,6 +131,14 @@ class DraftFormerPostProcess:
         sem = prob.max(dim=0).values
         if sem.ndim == 2:
             sem = sem.unsqueeze(0)
+        sem = F.interpolate(sem.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
+        pad_left = int(sample.get("pad_left", 0))
+        pad_top = int(sample.get("pad_top", 0))
+        pad_right = int(sample.get("pad_right", 0))
+        pad_bottom = int(sample.get("pad_bottom", 0))
+        y_end = height - pad_bottom if pad_bottom > 0 else height
+        x_end = width - pad_right if pad_right > 0 else width
+        sem = sem[:, pad_top:y_end, pad_left:x_end]
         sem = F.interpolate(sem.unsqueeze(0), size=(orig_h, orig_w), mode="bilinear", align_corners=False)[0]
         return sem
 

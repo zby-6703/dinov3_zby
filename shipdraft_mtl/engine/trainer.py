@@ -430,19 +430,27 @@ class Trainer:
 
     def eval(self):
         self.model.eval()
+        model_module = self.model.module if hasattr(self.model, "module") else self.model
+        previous_auxiliary = getattr(model_module, "return_auxiliary_outputs", False)
+        model_module.return_auxiliary_outputs = bool(
+            self.cfg.get("Eval", {}).get("return_auxiliary_outputs", previous_auxiliary)
+        )
         total_frame = 0
         total_time = 0.0
-        with torch.no_grad():
-            pbar = tqdm(total=len(self.valid_dataloader), desc="eval model:", position=0, leave=True)
-            for batch in self.valid_dataloader:
-                start = time.time()
-                outputs = self.model(batch)
-                total_time += time.time() - start
-                self.eval_class(outputs, batch)
-                total_frame += len(batch)
-                pbar.update(1)
-            pbar.close()
-        metric = self.eval_class.get_metric()
-        metric["fps"] = total_frame / max(total_time, 1e-9)
-        self.model.train()
+        try:
+            with torch.no_grad():
+                pbar = tqdm(total=len(self.valid_dataloader), desc="eval model:", position=0, leave=True)
+                for batch in self.valid_dataloader:
+                    start = time.time()
+                    outputs = self.model(batch)
+                    total_time += time.time() - start
+                    self.eval_class(outputs, batch)
+                    total_frame += len(batch)
+                    pbar.update(1)
+                pbar.close()
+            metric = self.eval_class.get_metric()
+            metric["fps"] = total_frame / max(total_time, 1e-9)
+        finally:
+            model_module.return_auxiliary_outputs = previous_auxiliary
+            self.model.train()
         return metric

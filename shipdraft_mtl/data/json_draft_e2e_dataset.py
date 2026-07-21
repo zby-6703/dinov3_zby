@@ -258,13 +258,17 @@ class PointSegDatasetMapper:
         pad_left = int(resize["pad_left"])
         pad_top = int(resize["pad_top"])
         points, labels, is_waterline = [], [], []
+        original_waterline_points = []
         for ann in sample.get("annotations", []):
             x, y = ann["point"]
             tx = float(np.clip(x * scale + pad_left, 0, target_w - 1e-3))
             ty = float(np.clip(y * scale + pad_top, 0, target_h - 1e-3))
             points.append([tx, ty])
             labels.append(int(ann["category_id"]))
-            is_waterline.append(bool(ann.get("is_waterline", False)))
+            point_is_waterline = bool(ann.get("is_waterline", False))
+            is_waterline.append(point_is_waterline)
+            if point_is_waterline:
+                original_waterline_points.append([float(x), float(y)])
         points_t = torch.tensor(points, dtype=torch.float32).reshape(-1, 2)
         labels_t = torch.tensor(labels, dtype=torch.int64)
         waterline_t = torch.tensor(is_waterline, dtype=torch.bool)
@@ -281,6 +285,18 @@ class PointSegDatasetMapper:
         elif len(waterline_points) == 1:
             x, y = np.rint(waterline_points[0].numpy()).astype(np.int32).tolist()
             cv2.circle(waterline_mask, (int(x), int(y)), max(1, int(round(target_h / 256.0))), 1, -1)
+        gt_waterline_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        if len(original_waterline_points) >= 2:
+            cv2.polylines(
+                gt_waterline_mask,
+                [np.rint(np.asarray(original_waterline_points)).astype(np.int32)],
+                isClosed=False,
+                color=1,
+                thickness=max(1, int(round(orig_h / 256.0 * 2.0))),
+            )
+        elif len(original_waterline_points) == 1:
+            x, y = np.rint(original_waterline_points[0]).astype(np.int32).tolist()
+            cv2.circle(gt_waterline_mask, (int(x), int(y)), max(1, int(round(orig_h / 256.0))), 1, -1)
         if len(points_t):
             pw = max(self.pseudo_box_size * target_w, 2.0)
             ph = max(self.pseudo_box_size * target_h, 2.0)
@@ -325,7 +341,7 @@ class PointSegDatasetMapper:
                 "masks": torch.zeros((len(points_t), target_h, target_w), dtype=torch.uint8),
                 "gt_boxes_original": boxes.clone(),
                 "gt_classes": labels_t.clone(),
-                "gt_sem_seg": torch.zeros((orig_h, orig_w), dtype=torch.uint8),
+                "gt_sem_seg": torch.from_numpy(gt_waterline_mask),
                 "draft_depth": torch.tensor(draft_depth_value, dtype=torch.float32),
                 "draft_depth_valid": torch.tensor(draft_valid, dtype=torch.bool),
             }

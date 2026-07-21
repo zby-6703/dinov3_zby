@@ -171,7 +171,7 @@ Metric:
   hybrid_det_weight: 0.0
   hybrid_seg_weight: 0.0
   hybrid_draft_weight: 1.0
-  evaluate_auxiliary: False
+  evaluate_auxiliary: True
   point_mode: True
   pck_threshold: 0.05
   det_class_names: ["0", "1", "2", "3", "4", "5", "6", "8", "M", "waterline"]
@@ -199,6 +199,9 @@ Train:
     pin_memory: True
 
 Eval:
+  # Validation diagnoses character detection and waterline segmentation.
+  # Architecture.return_auxiliary_outputs remains False for deployment.
+  return_auxiliary_outputs: True
   dataset:
     name: JsonDraftE2EDataset
     data_root: E:\data\PingLuRiver\dataset\ShipDraft_e2e

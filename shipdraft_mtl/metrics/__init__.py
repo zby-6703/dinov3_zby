@@ -29,7 +29,12 @@ class DraftFormerMetric:
         self.waterline_metric = WaterlineMetrics(water_class_id=1)
         self.depth_metric = DepthMetrics(epsilon_list=[0.05, 0.1, 0.2, 0.5])
         self._pck_hits = 0
+        self._pck_class_hits = 0
         self._pck_total = 0
+        self._point_predictions = 0
+        self._point_hits_by_class = np.zeros(len(self.det_class_names), dtype=np.int64)
+        self._point_gt_by_class = np.zeros(len(self.det_class_names), dtype=np.int64)
+        self._point_predictions_by_class = np.zeros(len(self.det_class_names), dtype=np.int64)
         self.pck_threshold = float(config.get("pck_threshold", 0.05))
 
     @staticmethod
@@ -53,8 +58,10 @@ class DraftFormerMetric:
     def __call__(self, outputs, batch):
         for output, sample in zip(outputs, batch):
             if self.evaluate_auxiliary:
-                self._update_detection(output, sample)
-            if not self.point_mode:
+                if not self.point_mode:
+                    self._update_detection(output, sample)
+                self._update_segmentation(output, sample)
+            elif not self.point_mode:
                 self._update_segmentation(output, sample)
             self._update_draft(output, sample)
             if self.point_mode and self.evaluate_auxiliary:
@@ -134,7 +141,21 @@ class DraftFormerMetric:
         if "points" not in output or "points" not in sample:
             return
         pred = output["points"].detach().cpu().numpy()
+        pred_labels = output["labels"].detach().cpu().numpy()
         gt = self._restore_points(sample["points"].detach().cpu().numpy(), sample)
+        gt_labels_t = sample.get("gt_classes", sample.get("labels"))
+        if gt_labels_t is None:
+            return
+        gt_labels = gt_labels_t.detach().cpu().numpy()
+        character_mask = gt_labels < len(self.det_class_names)
+        gt = gt[character_mask]
+        gt_labels = gt_labels[character_mask]
+        self._point_predictions += len(pred)
+        for label in pred_labels:
+            if 0 <= int(label) < len(self.det_class_names):
+                self._point_predictions_by_class[int(label)] += 1
+        for label in gt_labels:
+            self._point_gt_by_class[int(label)] += 1
         if len(gt) == 0:
             return
         oh = float(sample.get("orig_height", sample.get("height", 1)))
@@ -142,7 +163,8 @@ class DraftFormerMetric:
         thr = self.pck_threshold * max(oh, ow)
         # greedy match by distance ignoring class for rough PCK
         used = np.zeros(len(pred), dtype=bool)
-        for g in gt:
+        used_class = np.zeros(len(pred), dtype=bool)
+        for g, gt_label in zip(gt, gt_labels):
             if len(pred) == 0:
                 self._pck_total += 1
                 continue
@@ -153,13 +175,20 @@ class DraftFormerMetric:
             if d[j] <= thr:
                 self._pck_hits += 1
                 used[j] = True
+            class_distance = np.linalg.norm(pred - g[None, :], axis=1)
+            class_distance[used_class | (pred_labels != gt_label)] = 1e9
+            class_index = int(class_distance.argmin())
+            if class_distance[class_index] <= thr:
+                self._pck_class_hits += 1
+                used_class[class_index] = True
+                self._point_hits_by_class[int(gt_label)] += 1
 
     def get_metric(self):
         results = {}
-        if self.evaluate_auxiliary:
+        if self.evaluate_auxiliary and not self.point_mode:
             results.update(self.det_metric.compute())
 
-        if not self.point_mode:
+        if self.evaluate_auxiliary:
             seg_results = self.seg_metric.compute()
             water_results = self.waterline_metric.compute()
             results["mIoU"] = seg_results["mIoU"]
@@ -169,7 +198,7 @@ class DraftFormerMetric:
             results["water_iou"] = seg_results["per_class"]["water"]["IoU"]
             results["water_accuracy"] = seg_results["per_class"]["water"]["accuracy"]
             results.update(water_results)
-        else:
+        elif self.point_mode:
             results["water_iou"] = 0.0
 
         depth_results = self.depth_metric.compute()
@@ -180,15 +209,36 @@ class DraftFormerMetric:
         results["draft_score"] = 1.0 / (1.0 + max(madde, 0.0))
         if self._pck_total > 0:
             results["PCK"] = self._pck_hits / self._pck_total
+            results["PCK_class_aware"] = self._pck_class_hits / self._pck_total
         else:
             results["PCK"] = 0.0
+            results["PCK_class_aware"] = 0.0
+        point_precision = self._pck_class_hits / max(self._point_predictions, 1)
+        point_recall = self._pck_class_hits / max(self._pck_total, 1)
+        results["point_precision"] = point_precision
+        results["point_recall"] = point_recall
+        results["point_f1"] = 2.0 * point_precision * point_recall / max(point_precision + point_recall, 1e-12)
+        results["point_per_class"] = {
+            class_name: {
+                "precision": float(self._point_hits_by_class[index] / max(self._point_predictions_by_class[index], 1)),
+                "recall": float(self._point_hits_by_class[index] / max(self._point_gt_by_class[index], 1)),
+                "num_gt": int(self._point_gt_by_class[index]),
+                "num_predictions": int(self._point_predictions_by_class[index]),
+            }
+            for index, class_name in enumerate(self.det_class_names)
+        }
 
         self.det_metric.reset()
         self.seg_metric.reset()
         self.waterline_metric.reset()
         self.depth_metric.reset()
         self._pck_hits = 0
+        self._pck_class_hits = 0
         self._pck_total = 0
+        self._point_predictions = 0
+        self._point_hits_by_class.fill(0)
+        self._point_gt_by_class.fill(0)
+        self._point_predictions_by_class.fill(0)
 
         results["hybrid_score"] = self._hybrid_score(results)
         return results
