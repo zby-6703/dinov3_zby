@@ -373,12 +373,21 @@ class SetCriterion(nn.Module):
                 'masks': target_per_image['masks'][det_mask],
             })
 
-            # Create segmentation target
-            seg_labels_remapped = gt_labels[seg_mask] - self.num_classes
+            # Waterline is a single semantic mask, not one mask per sampled
+            # polyline point. The mapper stores the rasterized target separately.
+            waterline_mask = target_per_image.get("waterline_mask")
+            if waterline_mask is not None and waterline_mask.any():
+                seg_labels_remapped = torch.zeros(1, dtype=torch.int64, device=device)
+                seg_masks = waterline_mask.unsqueeze(0)
+                seg_boxes = torch.tensor([[0.5, 0.5, 1.0, 1.0]], dtype=torch.float32, device=device)
+            else:
+                seg_labels_remapped = torch.zeros(0, dtype=torch.int64, device=device)
+                seg_masks = target_per_image["masks"][:0]
+                seg_boxes = target_per_image["boxes"][:0]
             targets_seg.append({
                 'labels': seg_labels_remapped,
-                'boxes': target_per_image['boxes'][seg_mask],
-                'masks': target_per_image['masks'][seg_mask],
+                'boxes': seg_boxes,
+                'masks': seg_masks,
             })
 
         return targets_det, targets_seg

@@ -24,6 +24,8 @@ class StructureConstraintLoss(nn.Module):
         space_weight: float = 0.5,
         margin: float = 0.005,
         match_score_threshold: float = 0.05,
+        num_character_queries: int = 100,
+        num_character_classes: int = 9,
         enabled: bool = True,
     ) -> None:
         super().__init__()
@@ -31,6 +33,8 @@ class StructureConstraintLoss(nn.Module):
         self.space_weight = float(space_weight)
         self.margin = float(margin)
         self.match_score_threshold = float(match_score_threshold)
+        self.num_character_queries = int(num_character_queries)
+        self.num_character_classes = int(num_character_classes)
         self.enabled = bool(enabled)
         self.weight_dict = {
             "loss_struct_order": self.order_weight,
@@ -77,12 +81,17 @@ class StructureConstraintLoss(nn.Module):
             gt_labels = target.get("labels")
             if gt_points is None or gt_labels is None or len(gt_points) < 2:
                 continue
+            character_mask = gt_labels < self.num_character_classes
+            gt_points = gt_points[character_mask]
+            gt_labels = gt_labels[character_mask]
+            if len(gt_points) < 2:
+                continue
             order = torch.argsort(gt_points[:, 1])
             gt_points = gt_points[order]
             gt_labels = gt_labels[order]
             matched_pairs = self._match_points(
-                pred_points[batch_index],
-                pred_logits[batch_index],
+                pred_points[batch_index, : self.num_character_queries],
+                pred_logits[batch_index, : self.num_character_queries],
                 gt_points,
                 gt_labels,
             )
@@ -104,5 +113,8 @@ class StructureConstraintLoss(nn.Module):
 def build_structure_loss(config=None, class_names=None):
     cfg = dict(config or {})
     cfg.pop("name", None)
-    allowed = {"order_weight", "space_weight", "margin", "match_score_threshold", "enabled"}
+    allowed = {
+        "order_weight", "space_weight", "margin", "match_score_threshold",
+        "num_character_queries", "num_character_classes", "enabled",
+    }
     return StructureConstraintLoss(**{key: value for key, value in cfg.items() if key in allowed})

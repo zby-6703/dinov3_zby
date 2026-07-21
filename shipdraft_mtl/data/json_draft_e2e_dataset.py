@@ -268,6 +268,19 @@ class PointSegDatasetMapper:
         points_t = torch.tensor(points, dtype=torch.float32).reshape(-1, 2)
         labels_t = torch.tensor(labels, dtype=torch.int64)
         waterline_t = torch.tensor(is_waterline, dtype=torch.bool)
+        waterline_mask = np.zeros((target_h, target_w), dtype=np.uint8)
+        waterline_points = points_t[waterline_t]
+        if len(waterline_points) >= 2:
+            cv2.polylines(
+                waterline_mask,
+                [np.rint(waterline_points.numpy()).astype(np.int32)],
+                isClosed=False,
+                color=1,
+                thickness=max(1, int(round(target_h / 256.0 * 2.0))),
+            )
+        elif len(waterline_points) == 1:
+            x, y = np.rint(waterline_points[0].numpy()).astype(np.int32).tolist()
+            cv2.circle(waterline_mask, (int(x), int(y)), max(1, int(round(target_h / 256.0))), 1, -1)
         if len(points_t):
             pw = max(self.pseudo_box_size * target_w, 2.0)
             ph = max(self.pseudo_box_size * target_h, 2.0)
@@ -307,6 +320,7 @@ class PointSegDatasetMapper:
                 "points": points_t,
                 "labels": labels_t,
                 "is_waterline": waterline_t,
+                "waterline_mask": torch.from_numpy(waterline_mask),
                 "boxes": boxes,
                 "masks": torch.zeros((len(points_t), target_h, target_w), dtype=torch.uint8),
                 "gt_boxes_original": boxes.clone(),

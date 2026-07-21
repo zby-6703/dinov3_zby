@@ -1,6 +1,6 @@
 Global:
   device: gpu
-  epoch_num: 50
+  epoch_num: 300
   max_iter:
   log_smooth_window: 20
   print_batch_step: 50
@@ -8,7 +8,7 @@ Global:
   eval_batch_step: [100000000000, 1000]
   save_epoch_step: [1000, 1]
   save_iter_step: [100000000000, 2000]
-  output_dir: ./output/shipdraft_mtl/direct_depth_mtl_dinov3_convnext_tiny
+  output_dir: ./outputs/shipdraft_mtl/direct_depth_mtl_dinov3_convnext_tiny
   checkpoints:
   pretrained_model:
   seed: 48
@@ -35,6 +35,7 @@ Architecture:
   name: DraftFormerModel
   model_type: direct_depth_mtl
   point_mode: True
+  return_auxiliary_outputs: False
   in_channels: 3
   pixel_mean: [123.675, 116.280, 103.530]
   pixel_std: [58.395, 57.120, 57.375]
@@ -76,13 +77,13 @@ Architecture:
   Decoder:
     name: DraftFormerDecoder
     hidden_dim: 256
-    num_queries: 96
-    num_detection_queries: 96
+    num_queries: 140
+    num_detection_queries: 100
     nheads: 8
     dim_feedforward: 2048
-    dec_layers: 4
+    dec_layers: 6
     enforce_input_project: False
-    two_stage: True
+    two_stage: False
     initialize_box_type: "no"
     initial_pred: True
     learn_tgt: False
@@ -92,33 +93,35 @@ Architecture:
     dec_n_points: 4
     query_dim: 4
     dec_layer_share: False
-    use_task_embedding: False
+    use_task_embedding: True
     task_embedding_scale: 1.0
 
   Head:
     name: DraftFormerPredictionHead
     hidden_dim: 256
     mask_dim: 256
-    num_classes: 10
-    num_classes_seg: 0
-    num_detection_queries: 96
+    # Queries [0:100] detect scale characters; [100:140] segment waterline.
+    num_classes: 9
+    num_classes_seg: 1
+    num_detection_queries: 100
     semantic_ce_loss: False
     deep_supervision: True
 
   DirectDepth:
     enabled: True
     hidden_dim: 256
+    num_character_queries: 100
     min_depth: 0.0
     max_depth: 5.5
 
 Loss:
   name: DraftFormerLoss
   # Auxiliary scale-point task; direct depth is the primary objective below.
-  losses: [labels, boxes]
+  losses: [labels, boxes, masks]
   no_object_weight: 0.1
   class_weight: 4.0
-  mask_weight: 0.0
-  dice_weight: 0.0
+  mask_weight: 2.0
+  dice_weight: 2.0
   box_weight: 5.0
   giou_weight: 0.5
   num_points: 12544
@@ -131,9 +134,9 @@ Loss:
     cost_mask: 0.0
     cost_dice: 0.0
   matcher_seg:
-    cost_class: 4.0
-    cost_mask: 0.0
-    cost_dice: 0.0
+    cost_class: 2.0
+    cost_mask: 2.0
+    cost_dice: 2.0
     cost_box: 0.0
     cost_giou: 0.0
   task_balancer:
@@ -152,11 +155,6 @@ StructureLoss:
   margin: 0.005
   match_score_threshold: 0.05
 
-WaterlineHeatmap:
-  enabled: True
-  sigma: 2.0
-  weight: 1.5
-
 PostProcess:
   name: DraftFormerPostProcess
   score_thresh: 0.1
@@ -173,7 +171,7 @@ Metric:
   hybrid_det_weight: 0.0
   hybrid_seg_weight: 0.0
   hybrid_draft_weight: 1.0
-  evaluate_auxiliary: True
+  evaluate_auxiliary: False
   point_mode: True
   pck_threshold: 0.05
   det_class_names: ["0", "1", "2", "3", "4", "5", "6", "8", "M", "waterline"]
@@ -194,7 +192,7 @@ Train:
     waterline_spacing_px: 12
     point_pseudo_box_size: 0.05
   loader:
-    batch_size_per_card: 4
+    batch_size_per_card: 12
     shuffle: True
     drop_last: False
     num_workers: 2
@@ -212,7 +210,7 @@ Eval:
     waterline_spacing_px: 12
     point_pseudo_box_size: 0.05
   loader:
-    batch_size_per_card: 4
+    batch_size_per_card: 12
     shuffle: False
     drop_last: False
     num_workers: 2

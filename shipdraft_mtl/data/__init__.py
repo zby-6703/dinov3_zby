@@ -42,15 +42,19 @@ def _apply_metadata(config, metadata: DatasetMetadata) -> None:
     data_cfg["detection_classes"] = detection_classes
     data_cfg["segmentation_classes"] = segmentation_classes
     head_cfg = config["Architecture"]["Head"]
-    head_cfg["num_classes"] = metadata.num_detection_classes
-    # Direct-depth model keeps character and waterline labels in the point head.
+    # Direct-depth model uses character queries for detection and dedicated
+    # waterline queries for segmentation.
     if config.get("Architecture", {}).get("point_mode", False):
-        head_cfg["num_classes_seg"] = 0
+        character_classes = [name for name in detection_classes if name.lower() != "waterline"]
+        head_cfg["num_classes"] = len(character_classes)
+        head_cfg["num_classes_seg"] = 1 if "waterline" in [name.lower() for name in detection_classes] else 0
     else:
+        head_cfg["num_classes"] = metadata.num_detection_classes
         head_cfg["num_classes_seg"] = max(metadata.num_segmentation_classes if segmentation_classes else 0, head_cfg.get("num_classes_seg", 1) if segmentation_classes else 0)
         if segmentation_classes:
             head_cfg["num_classes_seg"] = len(segmentation_classes)
-    config.setdefault("Metric", {})["det_class_names"] = detection_classes
+    metric_classes = character_classes if config.get("Architecture", {}).get("point_mode", False) else detection_classes
+    config.setdefault("Metric", {})["det_class_names"] = metric_classes
 
 
 def build_dataloader(config, mode, logger, seed=None, epoch=1, task="multitask"):

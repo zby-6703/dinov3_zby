@@ -9,10 +9,6 @@ from shipdraft_mtl.modeling.backbones import build_backbone
 from shipdraft_mtl.modeling.decoders import build_decoder
 from shipdraft_mtl.modeling.encoders import build_encoder
 from shipdraft_mtl.modeling.heads import build_head
-from shipdraft_mtl.modeling.heads.waterline_heatmap_head import (
-    build_waterline_heatmap_head,
-    build_waterline_heatmap_loss,
-)
 from shipdraft_mtl.losses import build_loss
 from shipdraft_mtl.losses.direct_depth_loss import build_direct_depth_loss
 from shipdraft_mtl.modeling.heads.direct_depth_head import build_direct_depth_head
@@ -35,9 +31,8 @@ class DraftFormerModel(nn.Module):
         direct_depth_head=None,
         direct_depth_loss=None,
         structure_loss=None,
-        waterline_heatmap_head=None,
-        waterline_heatmap_loss=None,
         point_mode=False,
+        return_auxiliary_outputs=False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -49,9 +44,8 @@ class DraftFormerModel(nn.Module):
         self.direct_depth_head = direct_depth_head
         self.direct_depth_loss = direct_depth_loss
         self.structure_loss = structure_loss
-        self.waterline_heatmap_head = waterline_heatmap_head
-        self.waterline_heatmap_loss = waterline_heatmap_loss
         self.point_mode = bool(point_mode)
+        self.return_auxiliary_outputs = bool(return_auxiliary_outputs)
         self.register_buffer("pixel_mean", torch.tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.tensor(pixel_std).view(-1, 1, 1), False)
 
@@ -73,6 +67,7 @@ class DraftFormerModel(nn.Module):
             boxes = sample.get("boxes")
             masks = sample.get("masks")
             is_waterline = sample.get("is_waterline")
+            waterline_mask = sample.get("waterline_mask")
 
             if labels is None:
                 labels = torch.zeros(0, dtype=torch.int64, device=self.device)
@@ -113,6 +108,10 @@ class DraftFormerModel(nn.Module):
                 is_waterline = torch.zeros(len(labels), dtype=torch.bool, device=self.device)
             else:
                 is_waterline = is_waterline.to(self.device).bool()
+            if waterline_mask is None:
+                waterline_mask = torch.zeros(height, width, device=self.device)
+            else:
+                waterline_mask = waterline_mask.to(self.device).float()
 
             draft_depth = sample.get("draft_depth")
             if draft_depth is None:
@@ -132,6 +131,7 @@ class DraftFormerModel(nn.Module):
                     "labels": labels,
                     "masks": masks,
                     "is_waterline": is_waterline,
+                    "waterline_mask": waterline_mask,
                     "draft_depth": draft_depth_t,
                     "draft_depth_valid": draft_valid,
                 }
@@ -148,22 +148,30 @@ class DraftFormerModel(nn.Module):
             proposal_box_head=self.head.get_proposal_box_head(),
             bbox_refine_heads=self.head.get_bbox_refine_heads(),
         )
-        outputs = self.head(decoded, encoded["mask_features"], self.decoder)
-        outputs["pred_points"] = outputs["pred_boxes"][..., :2]
+        query_features = self.decoder.normalize_queries(decoded["decoder_states"][-1]).transpose(0, 1)
+        reference_points = decoded["references"][-1][..., :2]
+        if self.training or self.return_auxiliary_outputs:
+            outputs = self.head(decoded, encoded["mask_features"], self.decoder)
+            outputs["pred_points"] = outputs["pred_boxes"][..., :2]
+            depth_points = outputs["pred_points"]
+        else:
+            outputs = {}
+            depth_points = reference_points
 
         if self.direct_depth_head is not None:
             outputs.update(
                 self.direct_depth_head(
-                    outputs["decoder_hidden_states"],
-                    outputs["pred_points"],
-                    outputs["pred_logits"],
+                    query_features,
+                    depth_points,
                 )
             )
 
-        if self.training and self.waterline_heatmap_head is not None:
-            outputs["pred_waterline_heatmap_logits"] = self.waterline_heatmap_head(encoded["mask_features"])
-
         if not self.training:
+            if not self.return_auxiliary_outputs:
+                outputs = {
+                    "pred_depth": outputs["pred_depth"],
+                    "pred_depth_valid_logits": outputs["pred_depth_valid_logits"],
+                }
             return self.post_process(outputs, image_sizes, batched_inputs)
 
         targets = self.prepare_targets(batched_inputs, image_sizes)
@@ -172,11 +180,6 @@ class DraftFormerModel(nn.Module):
             losses.update(self.direct_depth_loss(outputs, targets))
         if self.structure_loss is not None:
             losses.update(self.structure_loss(outputs, targets))
-        if self.waterline_heatmap_head is not None and self.waterline_heatmap_loss is not None:
-            heatmap_logits = outputs.get("pred_waterline_heatmap_logits")
-            if heatmap_logits is not None:
-                heatmap_target = self.waterline_heatmap_head.build_targets(targets, heatmap_logits.shape[-2:])
-                losses.update(self.waterline_heatmap_loss(heatmap_logits, heatmap_target))
         return self._format_losses(losses)
 
     def _format_losses(self, losses: Dict[str, torch.Tensor]):
@@ -188,8 +191,6 @@ class DraftFormerModel(nn.Module):
             weight_dict.update(getattr(self.direct_depth_loss, "weight_dict", {}))
         if self.structure_loss is not None:
             weight_dict.update(getattr(self.structure_loss, "weight_dict", {}))
-        if self.waterline_heatmap_loss is not None:
-            weight_dict.update(getattr(self.waterline_heatmap_loss, "weight_dict", {}))
 
         for key, value in losses.items():
             if key in weight_dict:
@@ -252,15 +253,13 @@ def build_model(cfg):
     depth_cfg = arch_cfg.get("DirectDepth") or cfg.get("DirectDepth")
     if not depth_cfg or not depth_cfg.get("enabled", True):
         raise ValueError("DirectDepth must be enabled for the ROI-to-draft model")
-    class_names = list(cfg.get("Data", {}).get("detection_classes", []))
-    if not class_names:
-        class_names = list(cfg.get("Metric", {}).get("det_class_names", []))
-    waterline_class_id = class_names.index("waterline") if "waterline" in class_names else arch_cfg["Head"].get("num_classes", 1) - 1
     direct_depth_head = build_direct_depth_head(
         depth_cfg,
         query_dim=encoder.hidden_dim,
-        num_classes=arch_cfg["Head"].get("num_classes", len(class_names) or 10),
-        waterline_class_id=waterline_class_id,
+        num_character_queries=depth_cfg.get(
+            "num_character_queries",
+            arch_cfg["Decoder"].get("num_detection_queries", 100),
+        ),
     )
     direct_depth_loss = build_direct_depth_loss(
         cfg.get("DirectDepthLoss") or depth_cfg.get("loss") or {}
@@ -276,13 +275,6 @@ def build_model(cfg):
             class_names = list(cfg["Metric"]["det_class_names"])
         structure_loss = build_structure_loss(struct_cfg, class_names=class_names)
 
-    waterline_heatmap_head = None
-    waterline_heatmap_loss = None
-    heat_cfg = arch_cfg.get("WaterlineHeatmap") or cfg.get("WaterlineHeatmap")
-    if heat_cfg and heat_cfg.get("enabled", True):
-        waterline_heatmap_head = build_waterline_heatmap_head(heat_cfg, in_channels=encoder.hidden_dim)
-        waterline_heatmap_loss = build_waterline_heatmap_loss(heat_cfg)
-
     return DraftFormerModel(
         backbone=backbone,
         encoder=encoder,
@@ -295,7 +287,6 @@ def build_model(cfg):
         direct_depth_head=direct_depth_head,
         direct_depth_loss=direct_depth_loss,
         structure_loss=structure_loss,
-        waterline_heatmap_head=waterline_heatmap_head,
-        waterline_heatmap_loss=waterline_heatmap_loss,
         point_mode=point_mode,
+        return_auxiliary_outputs=arch_cfg.get("return_auxiliary_outputs", False),
     )
