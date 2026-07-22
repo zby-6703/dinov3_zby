@@ -1,9 +1,15 @@
 ftfy
+numpy
+opencv-python
 omegaconf
+PyYAML
 regex
 scikit-learn
+scipy
 submitit
 termcolor
 torch
 torchmetrics
 torchvision
+tqdm
+transformers>=4.56.0

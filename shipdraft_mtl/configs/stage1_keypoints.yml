@@ -1,0 +1,67 @@
+# Stage 1: character keypoints + dynamic waterline only (no draft depth).
+# Best checkpoint selected by keypoint_score = 0.5*PCK_class_aware + 0.5*waterline_curve_score
+_BASE_: default_e2e.yml
+
+Global:
+  epoch_num: 250
+  output_dir: ./outputs/shipdraft_mtl/stage1_keypoints
+  checkpoints:
+  pretrained_model:
+  # Optional: resume mid-stage1
+  # checkpoints: ./outputs/shipdraft_mtl/stage1_keypoints/latest.pth
+
+Optimizer:
+  lr: 0.0001
+  backbone_lr_mult: 0.1
+
+LRScheduler:
+  milestones: [50, 70]
+  gamma: 0.1
+  warmup_epoch: 1
+
+Architecture:
+  DirectDepth:
+    # Do not build / train draft-depth head in stage 1.
+    enabled: False
+
+TaskTrain:
+  stage: stage1_keypoints
+  train_character: True
+  train_waterline: True
+  train_depth: False
+  train_structure: True
+  freeze:
+    backbone: False
+    encoder: False
+    decoder: False
+    head: False
+    direct_depth_head: True
+
+Metric:
+  # Higher is better. Stage1 checkpoint criterion:
+  #   keypoint_score =
+  #     0.5 * (0.5*PCK_class_aware + 0.5*point_f1)
+  #   + 0.5 * (0.5*waterline_y_score + 0.5*waterline_y_median_score)
+  main_indicator: keypoint_score
+  evaluate_character: True
+  evaluate_waterline: True
+  evaluate_depth: False
+  # Tighter character localization (~0.02 * max(H,W); e.g. ~13px on 640-wide)
+  pck_threshold: 0.02
+  curve_pck_threshold: 0.02
+  # y-L1 score refs (pixels): score = 1 / (1 + err / ref)
+  curve_score_ref_px: 10.0
+  curve_y_score_ref_px: 8.0
+  keypoint_char_weight: 0.5
+  keypoint_waterline_weight: 0.5
+  keypoint_char_pck_weight: 0.5
+  keypoint_char_f1_weight: 0.5
+  keypoint_wl_mean_weight: 0.5
+  keypoint_wl_median_weight: 0.5
+  hybrid_char_metric: char_score
+  hybrid_waterline_metric: waterline_score
+  hybrid_char_weight: 0.5
+  hybrid_waterline_weight: 0.5
+  hybrid_draft_weight: 0.0
+  hybrid_det_weight: 0.5
+  hybrid_seg_weight: 0.5

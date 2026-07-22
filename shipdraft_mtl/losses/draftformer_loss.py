@@ -148,7 +148,11 @@ class SetCriterion(nn.Module):
                  num_classes_seg=1, 
                  semantic_ce_loss=False,
                  # 动态任务平衡器
-                 task_balancer=None):
+                 task_balancer=None,
+                 keypoint_mode=False,
+                 curve_smooth_weight=0.5,
+                 train_character=True,
+                 train_waterline=True):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -159,6 +163,8 @@ class SetCriterion(nn.Module):
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             num_detection_queries: number of queries assigned to detection task.
+            keypoint_mode: pure 2D character keypoints + ordered waterline curve points
+            train_character / train_waterline: multi-stage task switches
         """
         super().__init__()
         self.num_classes = num_classes
@@ -171,6 +177,10 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
+        self.keypoint_mode = bool(keypoint_mode)
+        self.curve_smooth_weight = float(curve_smooth_weight)
+        self.train_character = bool(train_character)
+        self.train_waterline = bool(train_waterline)
         
         # 为不同的任务创建不同的eos分类权重
         # 检测任务
@@ -237,7 +247,7 @@ class SetCriterion(nn.Module):
             num_classes = self.num_classes
         else: # seg
             num_classes = self.num_classes_seg
-            
+
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], num_classes,
@@ -255,12 +265,35 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """Box or pure-keypoint regression.
+
+        Keypoint mode uses L1 on 2D points (from pred_points / boxes[...,:2]).
+        Legacy mode uses L1 + GIoU on cxcywh boxes.
         """
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
+        if self.keypoint_mode or (
+            "pred_points" in outputs and outputs["pred_points"] is not None
+            and outputs["pred_boxes"].shape[-1] == 2
+        ):
+            src_points = outputs.get("pred_points")
+            if src_points is None:
+                src_points = outputs["pred_boxes"][..., :2]
+            src_points = src_points[idx]
+            target_points = []
+            for t, (_, i) in zip(targets, indices):
+                if "points" in t and t["points"] is not None and len(t["points"]):
+                    target_points.append(t["points"][i])
+                else:
+                    target_points.append(t["boxes"][i][..., :2])
+            target_points = torch.cat(target_points, dim=0)
+            loss_bbox = F.l1_loss(src_points, target_points, reduction="none")
+            losses = {
+                "loss_bbox": loss_bbox.sum() / num_boxes,
+                "loss_giou": src_points.new_zeros(()),
+            }
+            return losses
+
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
@@ -274,6 +307,99 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
 
         return losses
+
+    def loss_waterline_curve(self, outputs, targets):
+        """Dynamic-length ordered waterline curve supervision.
+
+        Max-N ordered slots (left-to-right). Each sample has a validity mask of
+        length N: the first M entries are real curve points (M adaptive), the
+        rest are padding (existence=0). Coordinate / smooth losses only apply on
+        valid slots — so effective curve length is dynamic at both train and test.
+        """
+        k = self.num_detection_queries
+        pred_points = outputs.get("pred_points")
+        if pred_points is None:
+            pred_points = outputs["pred_boxes"][..., :2]
+        pred_logits = outputs["pred_logits"]
+        nq = pred_points.shape[1]
+        zero = pred_points.new_zeros(())
+        if k >= nq:
+            return {"loss_ce": zero, "loss_curve": zero, "loss_curve_smooth": zero}
+
+        pred_curve = pred_points[:, k:]
+        pred_exist = pred_logits[:, k:, 0]
+        num_slots = pred_curve.shape[1]
+
+        exist_losses = []
+        curve_losses = []
+        smooth_losses = []
+        for batch_index, target in enumerate(targets):
+            has_waterline = target.get("has_waterline")
+            curve_gt = target.get("waterline_curve_points")
+            valid = target.get("waterline_curve_valid")
+            if has_waterline is None:
+                has_waterline = curve_gt is not None and valid is not None and bool(valid.any()) if valid is not None else (
+                    curve_gt is not None and len(curve_gt) > 0
+                )
+            else:
+                has_waterline = bool(has_waterline.item() if torch.is_tensor(has_waterline) else has_waterline)
+
+            if has_waterline and curve_gt is not None and len(curve_gt) > 0:
+                gt = curve_gt.to(device=pred_curve.device, dtype=pred_curve.dtype)
+                if gt.shape[0] != num_slots:
+                    if gt.shape[0] == 0:
+                        exist_target = pred_exist.new_zeros(num_slots)
+                        exist_losses.append(
+                            F.binary_cross_entropy_with_logits(pred_exist[batch_index], exist_target)
+                        )
+                        continue
+                    # Pad / truncate GT to slot count while preserving leading real points.
+                    padded = gt.new_zeros(num_slots, 2)
+                    n_copy = min(num_slots, gt.shape[0])
+                    padded[:n_copy] = gt[:n_copy]
+                    gt = padded
+                    if valid is None:
+                        valid = torch.zeros(num_slots, dtype=torch.bool, device=gt.device)
+                        valid[:n_copy] = True
+                if valid is None:
+                    # Backward compatible: all slots real.
+                    valid = torch.ones(num_slots, dtype=torch.bool, device=gt.device)
+                else:
+                    valid = valid.to(device=gt.device).bool()
+                    if valid.numel() != num_slots:
+                        v = torch.zeros(num_slots, dtype=torch.bool, device=gt.device)
+                        n_copy = min(num_slots, valid.numel())
+                        v[:n_copy] = valid[:n_copy]
+                        valid = v
+
+                exist_target = valid.float()
+                exist_losses.append(
+                    F.binary_cross_entropy_with_logits(pred_exist[batch_index], exist_target)
+                )
+                if valid.any():
+                    curve_losses.append(
+                        F.l1_loss(pred_curve[batch_index][valid], gt[valid], reduction="mean")
+                    )
+                    # Smooth only across consecutive *valid* pairs (usually a prefix).
+                    if valid.sum() >= 2:
+                        valid_idx = valid.nonzero(as_tuple=False).flatten()
+                        # Prefer a contiguous prefix for ordered waterlines.
+                        if valid_idx.numel() >= 2 and (valid_idx[-1] - valid_idx[0] + 1 == valid_idx.numel()):
+                            sl = slice(int(valid_idx[0]), int(valid_idx[-1]) + 1)
+                            pred_delta = pred_curve[batch_index, sl][1:] - pred_curve[batch_index, sl][:-1]
+                            gt_delta = gt[sl][1:] - gt[sl][:-1]
+                            smooth_losses.append(F.smooth_l1_loss(pred_delta, gt_delta, beta=0.01))
+            else:
+                exist_target = pred_exist.new_zeros(num_slots)
+                exist_losses.append(
+                    F.binary_cross_entropy_with_logits(pred_exist[batch_index], exist_target)
+                )
+
+        return {
+            "loss_ce": torch.stack(exist_losses).mean() if exist_losses else zero,
+            "loss_curve": torch.stack(curve_losses).mean() if curve_losses else zero,
+            "loss_curve_smooth": torch.stack(smooth_losses).mean() if smooth_losses else zero,
+        }
 
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.
@@ -406,7 +532,7 @@ class SetCriterion(nn.Module):
         return loss_map[loss](outputs, targets, indices, num_masks)
 
     def forward(self, outputs, targets, mask_dict=None):
-        """Compute dual-task losses for detection and segmentation."""
+        """Compute dual-task losses for detection and segmentation / curve points."""
         # 1. 分离 ground truth targets
         targets_det, targets_seg = self.split_targets_by_task(targets)
         
@@ -415,6 +541,9 @@ class SetCriterion(nn.Module):
         
         # 使用 num_detection_queries 来切分所有预测
         k = self.num_detection_queries
+        pred_points_all = outputs_without_aux.get("pred_points")
+        if pred_points_all is None:
+            pred_points_all = outputs_without_aux["pred_boxes"][..., :2]
         
         # 检测任务的预测
         # 确保类别维度正确
@@ -422,45 +551,52 @@ class SetCriterion(nn.Module):
             'pred_logits': outputs_without_aux['pred_logits'][:, :k, :self.num_classes],
             'pred_masks': outputs_without_aux['pred_masks'][:, :k, :, :],
             'pred_boxes': outputs_without_aux['pred_boxes'][:, :k, :],
+            'pred_points': pred_points_all[:, :k, :],
         }
 
-        # 分割任务的预测
-        # 只取前num_classes_seg个类别维度
+        # 分割 / 水线任务的预测
         outputs_seg = {
             'pred_logits': outputs_without_aux['pred_logits'][:, k:, :self.num_classes_seg],
             'pred_masks': outputs_without_aux['pred_masks'][:, k:, :, :],
             'pred_boxes': outputs_without_aux['pred_boxes'][:, k:, :],
+            'pred_points': pred_points_all[:, k:, :],
         }
         
         losses = {}
+        det_match_cost = ["cls", "point"] if self.keypoint_mode else ["cls", "box"]
+        device = next(iter(outputs.values())).device
+        zero = torch.zeros((), device=device)
 
         # ════════════════════════════════════════════════════════
-        # 3. 计算检测任务损失
+        # 3. 计算检测 / 字符关键点任务损失
         # ════════════════════════════════════════════════════════
-        # 使用检测任务专用的匹配器
-        # 检测任务只使用 cls + box 进行匹配，不使用mask
-        # 这样可以避免使用从bbox生成的伪造矩形mask，提升匹配质量
-        indices_det = self.matcher_det(outputs_det, targets_det, cost=["cls", "box"])
-        num_masks_det = sum(len(t["labels"]) for t in targets_det)
-        num_masks_det = torch.as_tensor([num_masks_det], dtype=torch.float, device=next(iter(outputs.values())).device)
-        if is_dist_avail_and_initialized():
-            torch.distributed.all_reduce(num_masks_det)
-        num_masks_det = torch.clamp(num_masks_det / get_world_size(), min=1).item()
-        
-        # 检测任务只计算 'labels' 和 'boxes' 损失，不计算 'masks' 损失
-        # 这样可以避免为150个检测查询计算昂贵的像素级mask损失，显著提升训练效率
-        for loss in ['labels', 'boxes']:
-            if loss in self.losses:
-                l_dict = self.get_loss(loss, outputs_det, targets_det, indices_det, num_masks_det, task='det')
-                losses.update({k + '_det': v for k, v in l_dict.items()})
+        num_masks_det = 1.0
+        indices_det = None
+        if self.train_character:
+            indices_det = self.matcher_det(outputs_det, targets_det, cost=det_match_cost)
+            num_masks_det = sum(len(t["labels"]) for t in targets_det)
+            num_masks_det = torch.as_tensor([num_masks_det], dtype=torch.float, device=device)
+            if is_dist_avail_and_initialized():
+                torch.distributed.all_reduce(num_masks_det)
+            num_masks_det = torch.clamp(num_masks_det / get_world_size(), min=1).item()
+
+            for loss in ['labels', 'boxes']:
+                if loss in self.losses:
+                    l_dict = self.get_loss(loss, outputs_det, targets_det, indices_det, num_masks_det, task='det')
+                    losses.update({key + '_det': v for key, v in l_dict.items()})
 
         # ════════════════════════════════════════════════════════
-        # 4. 计算分割任务损失（点分割 e2e 无 seg query 时跳过）
+        # 4. 水线：keypoint_mode 下动态长度曲线点；否则 mask 分割
         # ════════════════════════════════════════════════════════
         nq = outputs_without_aux["pred_logits"].shape[1]
         has_seg = (self.num_classes_seg > 0) and (k < nq) and (outputs_seg["pred_logits"].shape[1] > 0)
         num_masks_seg = 1.0
-        if has_seg:
+        if has_seg and self.keypoint_mode and self.train_waterline:
+            curve_losses = self.loss_waterline_curve(outputs_without_aux, targets)
+            losses["loss_ce_seg"] = curve_losses["loss_ce"]
+            losses["loss_curve_seg"] = curve_losses["loss_curve"]
+            losses["loss_curve_smooth_seg"] = curve_losses["loss_curve_smooth"]
+        elif has_seg and not self.keypoint_mode and self.train_waterline:
             indices_seg = self.matcher_seg(outputs_seg, targets_seg, cost=["cls", "mask"])
             num_masks_seg = sum(len(t["labels"]) for t in targets_seg)
             num_masks_seg = torch.as_tensor([num_masks_seg], dtype=torch.float, device=next(iter(outputs.values())).device)
@@ -470,42 +606,47 @@ class SetCriterion(nn.Module):
             for loss in ["labels", "masks"]:
                 if loss in self.losses:
                     l_dict = self.get_loss(loss, outputs_seg, targets_seg, indices_seg, num_masks_seg, task="seg")
-                    losses.update({k + "_seg": v for k, v in l_dict.items()})
+                    losses.update({key + "_seg": v for key, v in l_dict.items()})
 
         # ════════════════════════════════════════════════════════
         # 5. 计算辅助层损失 (Auxiliary outputs)
         # ════════════════════════════════════════════════════════
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
-                # 分离辅助层预测
-                # 🔥【修正】确保类别维度正确
+                aux_points = aux_outputs.get("pred_points")
+                if aux_points is None:
+                    aux_points = aux_outputs["pred_boxes"][..., :2]
                 aux_outputs_det = {
                     'pred_logits': aux_outputs['pred_logits'][:, :k, :self.num_classes],
                     'pred_masks': aux_outputs['pred_masks'][:, :k, :, :],
                     'pred_boxes': aux_outputs['pred_boxes'][:, :k, :],
+                    'pred_points': aux_points[:, :k, :],
                 }
                 aux_outputs_seg = {
                     'pred_logits': aux_outputs['pred_logits'][:, k:, :self.num_classes_seg],
                     'pred_masks': aux_outputs['pred_masks'][:, k:, :, :],
                     'pred_boxes': aux_outputs['pred_boxes'][:, k:, :],
+                    'pred_points': aux_points[:, k:, :],
                 }
 
-                # 使用各自的匹配器
-                # 检测辅助损失同样只计算 labels 和 boxes
-                # 辅助层也只使用 cls + box 匹配
-                indices_det_aux = self.matcher_det(aux_outputs_det, targets_det, cost=["cls", "box"])
-                for loss in ['labels', 'boxes']:
-                    if loss in self.losses:
-                        l_dict = self.get_loss(loss, aux_outputs_det, targets_det, indices_det_aux, num_masks_det, task='det')
-                        losses.update({k + f'_det_{i}': v for k, v in l_dict.items()})
+                if self.train_character:
+                    indices_det_aux = self.matcher_det(aux_outputs_det, targets_det, cost=det_match_cost)
+                    for loss in ['labels', 'boxes']:
+                        if loss in self.losses:
+                            l_dict = self.get_loss(loss, aux_outputs_det, targets_det, indices_det_aux, num_masks_det, task='det')
+                            losses.update({key + f'_det_{i}': v for key, v in l_dict.items()})
 
-                # 分割辅助损失（无 seg query 时跳过）
-                if has_seg:
+                if has_seg and self.keypoint_mode and self.train_waterline:
+                    curve_losses = self.loss_waterline_curve(aux_outputs, targets)
+                    losses[f"loss_ce_seg_{i}"] = curve_losses["loss_ce"]
+                    losses[f"loss_curve_seg_{i}"] = curve_losses["loss_curve"]
+                    losses[f"loss_curve_smooth_seg_{i}"] = curve_losses["loss_curve_smooth"]
+                elif has_seg and not self.keypoint_mode and self.train_waterline:
                     indices_seg_aux = self.matcher_seg(aux_outputs_seg, targets_seg, cost=["cls", "mask"])
                     for loss in ["labels", "masks"]:
                         if loss in self.losses:
                             l_dict = self.get_loss(loss, aux_outputs_seg, targets_seg, indices_seg_aux, num_masks_seg, task="seg")
-                            losses.update({k + f"_seg_{i}": v for k, v in l_dict.items()})
+                            losses.update({key + f"_seg_{i}": v for key, v in l_dict.items()})
                 
         # ════════════════════════════════════════════════════════
         # 6.计算 Contrastive Denoising Training 损失
@@ -624,6 +765,12 @@ def build_loss(config, architecture_config):
     config = copy.deepcopy(config)
     head_cfg = architecture_config["Head"]
     decoder_cfg = architecture_config["Decoder"]
+    keypoint_mode = bool(
+        architecture_config.get(
+            "keypoint_mode",
+            head_cfg.get("keypoint_mode", architecture_config.get("point_mode", False)),
+        )
+    )
 
     matcher_det_cfg = copy.deepcopy(config.get("matcher_det", {}))
     matcher_seg_cfg = copy.deepcopy(config.get("matcher_seg", {}))
@@ -633,8 +780,8 @@ def build_loss(config, architecture_config):
         cost_class=matcher_det_cfg.get("cost_class", 4.0),
         cost_mask=matcher_det_cfg.get("cost_mask", 0.0),
         cost_dice=matcher_det_cfg.get("cost_dice", 0.0),
-        cost_box=matcher_det_cfg.get("cost_box", 5.0),
-        cost_giou=matcher_det_cfg.get("cost_giou", 2.0),
+        cost_box=matcher_det_cfg.get("cost_box", matcher_det_cfg.get("cost_point", 5.0)),
+        cost_giou=matcher_det_cfg.get("cost_giou", 0.0 if keypoint_mode else 2.0),
         num_points=matcher_det_cfg.get("num_points", num_points),
     )
     matcher_seg = HungarianMatcher(
@@ -648,20 +795,45 @@ def build_loss(config, architecture_config):
 
     weight_dict = {
         "loss_ce_det": config.get("class_weight", 4.0),
-        "loss_bbox_det": config.get("box_weight", 5.0),
-        "loss_giou_det": config.get("giou_weight", 2.0),
-        "loss_ce_seg": config.get("class_weight", 4.0),
-        "loss_mask_seg": config.get("mask_weight", 5.0),
-        "loss_dice_seg": config.get("dice_weight", 5.0),
+        "loss_bbox_det": config.get("box_weight", config.get("point_weight", 5.0)),
+        "loss_giou_det": config.get("giou_weight", 0.0 if keypoint_mode else 2.0),
+        "loss_ce_seg": config.get("curve_exist_weight", config.get("class_weight", 4.0)),
     }
+    if keypoint_mode:
+        weight_dict.update(
+            {
+                "loss_curve_seg": config.get("curve_weight", 5.0),
+                "loss_curve_smooth_seg": config.get("curve_smooth_weight", 0.5),
+            }
+        )
+    else:
+        weight_dict.update(
+            {
+                "loss_mask_seg": config.get("mask_weight", 5.0),
+                "loss_dice_seg": config.get("dice_weight", 5.0),
+            }
+        )
     if head_cfg.get("deep_supervision", True):
         base_weight_dict = dict(weight_dict)
         for i in range(decoder_cfg.get("dec_layers", 6)):
             for key, value in base_weight_dict.items():
                 weight_dict[f"{key}_{i}"] = value
 
-    losses = config.get("losses", ["labels", "masks", "boxes"])
-    task_balancer = build_task_balancer(config.get("task_balancer", {}), ["det", "seg"])
+    if keypoint_mode:
+        losses = config.get("losses", ["labels", "boxes"])
+    else:
+        losses = config.get("losses", ["labels", "masks", "boxes"])
+    task_train = architecture_config.get("TaskTrain") or {}
+    task_names = []
+    if task_train.get("train_character", True):
+        task_names.append("det")
+    if task_train.get("train_waterline", True):
+        task_names.append("seg")
+    depth_cfg = architecture_config.get("DirectDepth") or {}
+    if depth_cfg.get("enabled", True) and task_train.get("train_depth", True):
+        task_names.append("draft")
+    task_balancer = build_task_balancer(config.get("task_balancer", {}), task_names)
+    # Allow TaskTrain at root cfg via architecture_config passthrough from build_model.
 
     return DraftFormerLoss(
         num_classes=head_cfg["num_classes"],
@@ -677,4 +849,8 @@ def build_loss(config, architecture_config):
         num_classes_seg=head_cfg.get("num_classes_seg", 1),
         semantic_ce_loss=head_cfg.get("semantic_ce_loss", False),
         task_balancer=task_balancer,
+        keypoint_mode=keypoint_mode,
+        curve_smooth_weight=config.get("curve_smooth_weight", 0.5),
+        train_character=task_train.get("train_character", True),
+        train_waterline=task_train.get("train_waterline", True),
     )

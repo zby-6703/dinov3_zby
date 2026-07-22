@@ -64,10 +64,12 @@ class DraftFormerDecoder(nn.Module):
         self.task_embedding_scale = float(task_embedding_scale)
         self.task_embedding = nn.Embedding(2, hidden_dim) if use_task_embedding else None
 
+        self.query_dim = int(query_dim)
         if not two_stage or self.learn_tgt:
             self.query_feat = nn.Embedding(num_queries, hidden_dim)
         if not two_stage and initialize_box_type == "no":
-            self.query_embed = nn.Embedding(num_queries, 4)
+            self.query_embed = nn.Embedding(num_queries, self.query_dim)
+            self._init_reference_priors()
         if two_stage:
             self.enc_output = nn.Linear(hidden_dim, hidden_dim)
             self.enc_output_norm = nn.LayerNorm(hidden_dim)
@@ -104,6 +106,31 @@ class DraftFormerDecoder(nn.Module):
 
     def normalize_queries(self, query_state):
         return self.output_norm(query_state)
+
+    def _init_reference_priors(self):
+        """Bias learnable references: characters scattered, waterline left-to-right."""
+        if not hasattr(self, "query_embed"):
+            return
+        with torch.no_grad():
+            weight = self.query_embed.weight
+            nn.init.uniform_(weight, 0.0, 1.0)
+            detection_end = min(int(self.num_detection_queries), int(self.num_queries))
+            if self.query_dim == 2 and detection_end < self.num_queries:
+                n_curve = self.num_queries - detection_end
+                xs = torch.linspace(0.05, 0.95, n_curve, device=weight.device)
+                ys = torch.full((n_curve,), 0.55, device=weight.device)
+                curve = torch.stack([xs, ys], dim=-1).clamp(1e-3, 1.0 - 1e-3)
+                weight[detection_end:] = inverse_sigmoid(curve)
+            elif self.query_dim == 4 and detection_end < self.num_queries:
+                n_curve = self.num_queries - detection_end
+                xs = torch.linspace(0.05, 0.95, n_curve, device=weight.device)
+                ys = torch.full((n_curve,), 0.55, device=weight.device)
+                wh = torch.full((n_curve, 2), 0.05, device=weight.device)
+                curve = torch.cat([torch.stack([xs, ys], dim=-1), wh], dim=-1).clamp(1e-3, 1.0 - 1e-3)
+                weight[detection_end:] = inverse_sigmoid(curve)
+            # Convert remaining uniform samples to unsigmoid space.
+            active = weight[:detection_end] if detection_end > 0 else weight
+            active.copy_(inverse_sigmoid(active.clamp(1e-3, 1.0 - 1e-3)))
 
     def add_task_embedding(self, tgt):
         if self.task_embedding is None:
@@ -330,10 +357,14 @@ class TransformerDecoder(nn.Module):
             if self.training and self.decoder_query_perturber is not None and layer_id != 0:
                 reference_points = self.decoder_query_perturber(reference_points)
 
-            reference_points_input = (
-                reference_points[:, :, None]
-                * torch.cat([valid_ratios, valid_ratios], -1)[None, :]
-            )
+            # 2D keypoints use [x,y]; 4D boxes use [cx,cy,w,h] with repeated valid ratios.
+            if reference_points.shape[-1] == 2:
+                reference_points_input = reference_points[:, :, None] * valid_ratios[None, :]
+            else:
+                reference_points_input = (
+                    reference_points[:, :, None]
+                    * torch.cat([valid_ratios, valid_ratios], -1)[None, :]
+                )
             query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :])
 
             raw_query_pos = self.ref_point_head(query_sine_embed)
@@ -359,16 +390,29 @@ class TransformerDecoder(nn.Module):
             if bbox_embed is not None:
                 total_queries = output.shape[0]
                 reference_before_sigmoid = inverse_sigmoid(reference_points)
-
-                if num_detection_queries is None:
+                # Pure keypoint mode (query_dim=2): refine every query as a 2D point,
+                # including ordered waterline curve slots.
+                refine_all = reference_points.shape[-1] == 2
+                if refine_all or num_detection_queries is None:
                     detection_end = total_queries
                 else:
                     detection_end = min(num_detection_queries, total_queries)
 
                 if detection_end > 0:
-                    delta_unsig_det = bbox_embed[layer_id](output[:detection_end]).to(device)
-                    outputs_unsig_det = delta_unsig_det + reference_before_sigmoid[:detection_end]
-                    new_reference_points_det = outputs_unsig_det.sigmoid()
+                    delta_unsig = bbox_embed[layer_id](output[:detection_end]).to(device)
+                    # Allow head output dim to match reference dim even if legacy 4D head
+                    # is paired with 2D references (take the first dims).
+                    if delta_unsig.shape[-1] != reference_before_sigmoid.shape[-1]:
+                        dim = min(delta_unsig.shape[-1], reference_before_sigmoid.shape[-1])
+                        delta_unsig = delta_unsig[..., :dim]
+                        ref_slice = reference_before_sigmoid[:detection_end, ..., :dim]
+                    else:
+                        ref_slice = reference_before_sigmoid[:detection_end]
+                    outputs_unsig = delta_unsig + ref_slice
+                    new_reference_points_det = outputs_unsig.sigmoid()
+                    if new_reference_points_det.shape[-1] < reference_points.shape[-1]:
+                        pad = reference_points[:detection_end, ..., new_reference_points_det.shape[-1] :]
+                        new_reference_points_det = torch.cat([new_reference_points_det, pad], dim=-1)
                     if detection_end < total_queries:
                         new_reference_points = torch.cat(
                             [new_reference_points_det, reference_points[detection_end:]], dim=0

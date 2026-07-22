@@ -114,13 +114,30 @@ class HungarianMatcher(nn.Module):
         # Iterate through batch size
         for b in range(bs):
             out_bbox = outputs["pred_boxes"][b]
-            if 'box' in cost:
-                tgt_bbox=targets[b]["boxes"]
-                cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
-                cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
-                # 🔥【修复】处理box cost中的无效值
-                cost_bbox = torch.nan_to_num(cost_bbox, nan=0.0, posinf=1e4, neginf=-1e4)
-                cost_giou = torch.nan_to_num(cost_giou, nan=0.0, posinf=1e4, neginf=-1e4)
+            out_points = outputs.get("pred_points")
+            if out_points is not None:
+                out_pts = out_points[b]
+            else:
+                out_pts = out_bbox[..., :2]
+
+            if "point" in cost:
+                if "points" in targets[b] and targets[b]["points"] is not None and len(targets[b]["points"]):
+                    tgt_pts = targets[b]["points"]
+                else:
+                    tgt_pts = targets[b]["boxes"][..., :2]
+                cost_bbox = torch.cdist(out_pts, tgt_pts, p=1)
+                cost_giou = torch.zeros_like(cost_bbox)
+            elif "box" in cost:
+                tgt_bbox = targets[b]["boxes"]
+                # Support pure 2D keypoint tensors stored under "boxes".
+                if out_bbox.shape[-1] == 2 or tgt_bbox.shape[-1] == 2:
+                    cost_bbox = torch.cdist(out_bbox[..., :2], tgt_bbox[..., :2], p=1)
+                    cost_giou = torch.zeros_like(cost_bbox)
+                else:
+                    cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+                    cost_giou = -generalized_box_iou(
+                        box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox)
+                    )
             else:
                 cost_bbox = torch.tensor(0).to(out_bbox)
                 cost_giou = torch.tensor(0).to(out_bbox)
@@ -133,8 +150,6 @@ class HungarianMatcher(nn.Module):
             neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
             pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
             cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
-            # 🔥【修复】处理class cost中的无效值
-            cost_class = torch.nan_to_num(cost_class, nan=0.0, posinf=1e4, neginf=-1e4)
 
             # Compute the classification cost. Contrary to the loss, we don't use the NLL,
             # but approximate it in 1 - proba[target class].
@@ -174,9 +189,6 @@ class HungarianMatcher(nn.Module):
                     else:
                         cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
                         cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
-                    # 🔥【修复】处理mask cost中的无效值
-                    cost_mask = torch.nan_to_num(cost_mask, nan=0.0, posinf=1e4, neginf=-1e4)
-                    cost_dice = torch.nan_to_num(cost_dice, nan=0.0, posinf=1e4, neginf=-1e4)
 
             else:
                 cost_mask = torch.tensor(0).to(out_bbox)
@@ -192,10 +204,11 @@ class HungarianMatcher(nn.Module):
             )
             C = C.reshape(num_queries, -1).cpu()
             
-            # 🔥【修复】处理无效数值，防止 linear_sum_assignment 报错
-            # 将 NaN 和 Inf 替换为一个较大的有限值
-            if torch.isnan(C).any() or torch.isinf(C).any():
-                C = torch.nan_to_num(C, nan=1e6, posinf=1e6, neginf=-1e6)
+            if not torch.isfinite(C).all():
+                raise FloatingPointError(
+                    f"Hungarian matching cost contains NaN/Inf for batch item {b}; "
+                    "check model outputs, labels, and AMP stability."
+                )
             
             indices.append(linear_sum_assignment(C))
 

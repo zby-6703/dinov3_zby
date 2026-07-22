@@ -5,10 +5,14 @@ channels:
 dependencies:
   - python=3.11
   - omegaconf
+  - numpy
+  - scipy
+  - pyyaml
   - pip
   - pip:
     - ftfy # needed for dino.txt
     - iopath
+    - opencv-python
     - omegaconf
     - pandas 
     - regex # needed for dino.txt
@@ -20,4 +24,6 @@ dependencies:
     - torch 
     - torchvision 
     - torchmetrics
+    - tqdm
+    - transformers>=4.56.0
     

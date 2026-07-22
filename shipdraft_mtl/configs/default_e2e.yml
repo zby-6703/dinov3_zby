@@ -34,7 +34,10 @@ LRScheduler:
 Architecture:
   name: DraftFormerModel
   model_type: direct_depth_mtl
+  # True keypoint mode: pure 2D character points + ordered waterline curve points.
+  # No pseudo-box regression and no waterline mask primary path.
   point_mode: True
+  keypoint_mode: True
   return_auxiliary_outputs: False
   in_channels: 3
   pixel_mean: [123.675, 116.280, 103.530]
@@ -77,8 +80,9 @@ Architecture:
   Decoder:
     name: DraftFormerDecoder
     hidden_dim: 256
-    num_queries: 140
-    num_detection_queries: 100
+    # 80 character keypoint queries + 10 dynamic waterline curve slots (max length 10)
+    num_queries: 90
+    num_detection_queries: 80
     nheads: 8
     dim_feedforward: 2048
     dec_layers: 6
@@ -91,7 +95,8 @@ Architecture:
     dropout: 0.0
     activation: relu
     dec_n_points: 4
-    query_dim: 4
+    # Pure 2D keypoints / curve points (not cxcywh boxes)
+    query_dim: 2
     dec_layer_share: False
     use_task_embedding: True
     task_embedding_scale: 1.0
@@ -100,43 +105,65 @@ Architecture:
     name: DraftFormerPredictionHead
     hidden_dim: 256
     mask_dim: 256
-    # Queries [0:100] detect scale characters; [100:140] segment waterline.
+    # Queries [0:80]  -> multi-class character keypoints
+    # Queries [80:90] -> dynamic waterline curve points + existence (max 10)
     num_classes: 9
     num_classes_seg: 1
-    num_detection_queries: 100
+    num_detection_queries: 80
     semantic_ce_loss: False
     deep_supervision: True
+    keypoint_mode: True
+    predict_masks: False
 
   DirectDepth:
     enabled: True
     hidden_dim: 256
-    num_character_queries: 100
+    num_character_queries: 80
     min_depth: 0.0
     max_depth: 5.5
 
+# Multi-stage training switches (override in stage*.yml).
+TaskTrain:
+  stage: joint
+  train_character: True
+  train_waterline: True
+  train_depth: True
+  train_structure: True
+  freeze:
+    backbone: False
+    encoder: False
+    decoder: False
+    head: False
+    direct_depth_head: False
+
 Loss:
   name: DraftFormerLoss
-  # Auxiliary scale-point task; direct depth is the primary objective below.
-  losses: [labels, boxes, masks]
+  # Character keypoints (Hungarian set prediction) + ordered waterline curve points.
+  # Direct depth remains the primary objective via DirectDepthLoss.
+  losses: [labels, boxes]
   no_object_weight: 0.1
   class_weight: 4.0
-  mask_weight: 2.0
-  dice_weight: 2.0
+  point_weight: 5.0
   box_weight: 5.0
-  giou_weight: 0.5
+  giou_weight: 0.0
+  curve_weight: 5.0
+  curve_exist_weight: 2.0
+  curve_smooth_weight: 0.5
   num_points: 12544
   oversample_ratio: 3.0
   importance_sample_ratio: 0.75
   matcher_det:
     cost_class: 4.0
+    cost_point: 5.0
     cost_box: 5.0
-    cost_giou: 0.5
+    cost_giou: 0.0
     cost_mask: 0.0
     cost_dice: 0.0
   matcher_seg:
+    # Unused in keypoint_mode (ordered curve uses identity matching)
     cost_class: 2.0
-    cost_mask: 2.0
-    cost_dice: 2.0
+    cost_mask: 0.0
+    cost_dice: 0.0
     cost_box: 0.0
     cost_giou: 0.0
   task_balancer:
@@ -162,18 +189,43 @@ PostProcess:
   nms_type: none
   nms_thresh: 0.0
   point_nms_dist: 0.03
+  waterline_score_thresh: 0.3
+  waterline_keep_all: True
 
 Metric:
   name: DraftFormerMetric
-  main_indicator: draft_score
-  hybrid_det_metric: mAP@0.5
-  hybrid_seg_metric: water_iou
-  hybrid_det_weight: 0.0
-  hybrid_seg_weight: 0.0
-  hybrid_draft_weight: 1.0
+  # Default joint run: draft-primary hybrid (override per stage*.yml).
+  main_indicator: hybrid_score
+  # Character keypoints (tighter PCK + F1 used inside char_score / keypoint_score)
+  hybrid_char_metric: char_score
+  hybrid_char_weight: 0.2
+  # Waterline: vertical error scores (y-L1 mean/median)
+  hybrid_waterline_metric: waterline_score
+  hybrid_waterline_weight: 0.2
+  # Draft depth reading
+  hybrid_draft_metric: draft_score
+  hybrid_draft_weight: 0.6
+  # Legacy aliases
+  hybrid_det_metric: char_score
+  hybrid_seg_metric: waterline_score
+  hybrid_det_weight: 0.2
+  hybrid_seg_weight: 0.2
+  evaluate_character: True
+  evaluate_waterline: True
+  evaluate_depth: True
   evaluate_auxiliary: True
   point_mode: True
-  pck_threshold: 0.05
+  keypoint_mode: True
+  pck_threshold: 0.02
+  curve_pck_threshold: 0.02
+  curve_score_ref_px: 10.0
+  curve_y_score_ref_px: 8.0
+  keypoint_char_weight: 0.5
+  keypoint_waterline_weight: 0.5
+  keypoint_char_pck_weight: 0.5
+  keypoint_char_f1_weight: 0.5
+  keypoint_wl_mean_weight: 0.5
+  keypoint_wl_median_weight: 0.5
   det_class_names: ["0", "1", "2", "3", "4", "5", "6", "8", "M", "waterline"]
 
 Input:
@@ -190,6 +242,11 @@ Train:
     pad_value: 0
     filter_empty: True
     waterline_spacing_px: 12
+    # Max waterline slots (= num_queries - num_detection_queries). Actual length is adaptive.
+    num_waterline_points: 10
+    min_waterline_points: 2
+    # Adaptive GT density in original pixels (~640-wide ROI => about 8-10 points)
+    waterline_target_spacing_px: 48
     point_pseudo_box_size: 0.05
   loader:
     batch_size_per_card: 12
@@ -199,7 +256,7 @@ Train:
     pin_memory: True
 
 Eval:
-  # Validation diagnoses character detection and waterline segmentation.
+  # Validation diagnoses character keypoints and waterline curve points.
   # Architecture.return_auxiliary_outputs remains False for deployment.
   return_auxiliary_outputs: True
   dataset:
@@ -211,6 +268,9 @@ Eval:
     pad_value: 0
     filter_empty: False
     waterline_spacing_px: 12
+    num_waterline_points: 10
+    min_waterline_points: 2
+    waterline_target_spacing_px: 48
     point_pseudo_box_size: 0.05
   loader:
     batch_size_per_card: 12

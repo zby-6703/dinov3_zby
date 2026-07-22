@@ -28,4 +28,11 @@ def build_post_process(config, architecture_config):
             architecture_config.get("model_type") in {"point_seg_e2e", "point_seg", "e2e_point"},
         ),
     )
+    config.setdefault(
+        "keypoint_mode",
+        architecture_config.get(
+            "keypoint_mode",
+            head_cfg.get("keypoint_mode", config.get("point_mode", False)),
+        ),
+    )
     return module_class(**config)

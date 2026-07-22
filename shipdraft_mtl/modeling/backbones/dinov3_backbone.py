@@ -59,7 +59,13 @@ def _load_dinov3_hub_model(
     trust_repo: Optional[bool],
     skip_validation: bool,
     verbose: bool,
+    allow_remote_code: bool,
 ):
+    if source == "github" and not allow_remote_code:
+        raise ValueError(
+            "source='github' executes repository code. Clone the repository and use "
+            "source='local', or explicitly set allow_remote_code=True for a trusted revision."
+        )
     entrypoint_kwargs = dict(model_kwargs or {})
     entrypoint_kwargs["pretrained"] = pretrained
     if weights not in (None, ""):
@@ -239,6 +245,7 @@ class DINOv3ViTBackbone(_FrozenTrainMixin, nn.Module):
         trust_repo=True,
         skip_validation=False,
         verbose=True,
+        allow_remote_code=False,
     ):
         super().__init__()
         if in_channels != 3:
@@ -261,6 +268,7 @@ class DINOv3ViTBackbone(_FrozenTrainMixin, nn.Module):
             trust_repo=trust_repo,
             skip_validation=skip_validation,
             verbose=verbose,
+            allow_remote_code=allow_remote_code,
         )
 
         self.patch_size = _as_int_patch_size(getattr(self.model, "patch_size", 16))
@@ -398,6 +406,7 @@ class DINOv3ConvNeXtBackbone(_FrozenTrainMixin, nn.Module):
         verbose=True,
         local_files_only=True,
         trust_remote_code=False,
+        allow_remote_code=False,
     ):
         super().__init__()
         if in_channels != 3:
@@ -433,6 +442,7 @@ class DINOv3ConvNeXtBackbone(_FrozenTrainMixin, nn.Module):
                 trust_repo=trust_repo,
                 skip_validation=skip_validation,
                 verbose=verbose,
+                allow_remote_code=allow_remote_code,
             )
 
         self._stage_indices = {name: index for index, name in enumerate(_FEATURE_NAMES)}

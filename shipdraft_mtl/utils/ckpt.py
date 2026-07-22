@@ -7,9 +7,12 @@ from .logging import get_logger
 
 def _torch_load_checkpoint(path, map_location):
     try:
-        return torch.load(path, map_location=map_location, weights_only=False)
+        return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
-        return torch.load(path, map_location=map_location)
+        raise RuntimeError(
+            "This PyTorch version cannot safely load checkpoints. Upgrade PyTorch "
+            "to a version that supports torch.load(..., weights_only=True)."
+        )
 
 
 def _model_state_dict(model, distributed=False):
@@ -58,11 +61,7 @@ def load_ckpt(model, cfg, optimizer=None, lr_scheduler=None, logger=None):
     if checkpoints and os.path.exists(checkpoints):
         checkpoint = _torch_load_checkpoint(checkpoints, map_location=torch.device("cpu"))
         state_dict = _extract_state_dict(checkpoint)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            logger.info(f"checkpoint missing keys: {len(missing)}")
-        if unexpected:
-            logger.info(f"checkpoint unexpected keys: {len(unexpected)}")
+        model.load_state_dict(state_dict, strict=True)
         if optimizer is not None and checkpoint.get("optimizer") is not None:
             optimizer.load_state_dict(checkpoint["optimizer"])
         if lr_scheduler is not None and checkpoint.get("scheduler") is not None:
@@ -91,6 +90,10 @@ def _extract_state_dict(checkpoint):
 def load_pretrained_params(model, pretrained_model, logger=None):
     if logger is None:
         logger = get_logger()
+    # Avoid Windows escape corruption (e.g. "\best.pth" -> backspace + "est.pth").
+    pretrained_model = os.path.normpath(str(pretrained_model).replace("\\", "/"))
+    if not os.path.isfile(pretrained_model):
+        raise FileNotFoundError(f"Checkpoint not found: {pretrained_model}")
     checkpoint = _torch_load_checkpoint(pretrained_model, map_location=torch.device("cpu"))
     state_dict = _extract_state_dict(checkpoint)
     model_state = model.state_dict()

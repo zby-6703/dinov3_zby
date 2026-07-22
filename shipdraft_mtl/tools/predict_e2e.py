@@ -1,11 +1,15 @@
 r"""Run ROI inference and export LabelMe JSON plus visualization images.
 
-Usage from the project root:
-    python shipdraft_mtl\tools\predict_e2e.py --input E:\data\PingLuRiver\dataset\ShipDraft_e2e\test\pl_3.jpg --output-dir outputs\predict_e2e --device cuda
+Examples (from project root ``dinov3_zby``)::
 
-Directory inference uses the same command with ``--input`` set to an image
-directory. The default config and checkpoint are defined below; use
-``--config`` and ``--weights`` to override them.
+    python shipdraft_mtl/tools/predict_e2e.py ^
+      --config shipdraft_mtl/configs/stage1_keypoints.yml ^
+      --weights outputs/shipdraft_mtl/stage1_keypoints/best.pth ^
+      --input E:/data/PingLuRiver/dataset/ShipDraft_e2e/test ^
+      --output-dir outputs/shipdraft_mtl/stage1_keypoints/predict
+
+On Windows, prefer forward slashes in paths, or quote the argument, so that
+``\b`` in ``\best.pth`` is not eaten by shell/string escaping.
 """
 
 from __future__ import annotations
@@ -28,26 +32,38 @@ if str(PROJECT_ROOT) not in sys.path:
 from shipdraft_mtl.engine.predictor import DraftFormerPredictor, get_image_files
 
 
-DEFAULT_CONFIG = PROJECT_ROOT / "shipdraft_mtl" / "configs" / "default_e2e.yml"
-DEFAULT_WEIGHTS = (
-    PROJECT_ROOT
-    / "outputs"
-    / "shipdraft_mtl"
-    / "direct_depth_mtl_dinov3_convnext_tiny"
-    / "best.pth"
-)
+def normalize_user_path(path: str) -> Path:
+    """Turn a user path into an absolute Path (safe on Windows)."""
+    text = str(path).strip().strip('"').strip("'")
+    # If the string was already corrupted by Python ``\b`` in source defaults,
+    # callers should pass CLI args (shell does not interpret \b like Python does).
+    text = text.replace("\\", "/")
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        candidate = (PROJECT_ROOT / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    return candidate
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="Input image or image directory")
     parser.add_argument("--output-dir", required=True, help="Directory for JSON and visualization files")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Model YAML config")
-    parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS), help="Model checkpoint")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Model YAML, e.g. shipdraft_mtl/configs/stage1_keypoints.yml",
+    )
+    parser.add_argument(
+        "--weights",
+        required=True,
+        help="Checkpoint, e.g. outputs/shipdraft_mtl/stage1_keypoints/best.pth",
+    )
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--score-thresh", type=float, default=0.1, help="Character confidence threshold")
-    parser.add_argument("--waterline-thresh", type=float, default=0.3, help="Waterline probability threshold")
-    parser.add_argument("--waterline-spacing", type=int, default=12, help="Exported waterline point spacing in pixels")
+    parser.add_argument("--waterline-thresh", type=float, default=0.3, help="Waterline score threshold")
+    parser.add_argument("--waterline-spacing", type=int, default=12, help="Legacy mask-export spacing (px)")
     parser.add_argument("--valid-thresh", type=float, default=0.5, help="Draft validity threshold")
     return parser.parse_args()
 
@@ -69,9 +85,10 @@ def _median_smooth(values: np.ndarray, kernel_size: int = 9) -> np.ndarray:
     kernel_size = max(kernel_size, 3)
     pad = kernel_size // 2
     padded = np.pad(values.astype(np.float32), (pad, pad), mode="edge")
-    return np.asarray([
-        np.median(padded[index : index + kernel_size]) for index in range(len(values))
-    ], dtype=np.float32)
+    return np.asarray(
+        [np.median(padded[index : index + kernel_size]) for index in range(len(values))],
+        dtype=np.float32,
+    )
 
 
 def extract_waterline(
@@ -83,7 +100,8 @@ def extract_waterline(
     if probability.ndim == 3:
         probability = probability[0]
     if probability.ndim != 2 or probability.size == 0:
-        return [], np.zeros(probability.shape[-2:], dtype=np.uint8), 0.0
+        shape = probability.shape[-2:] if probability.ndim >= 2 else (0, 0)
+        return [], np.zeros(shape, dtype=np.uint8), 0.0
 
     maximum = probability.max(axis=0)
     effective_threshold = float(threshold)
@@ -109,6 +127,10 @@ def extract_waterline(
     return points, binary_mask, confidence
 
 
+def character_class_names(class_names: Sequence[str]) -> List[str]:
+    return [name for name in class_names if str(name).lower() != "waterline"]
+
+
 def character_shapes(
     points: np.ndarray,
     scores: np.ndarray,
@@ -116,12 +138,13 @@ def character_shapes(
     class_names: Sequence[str],
     threshold: float,
 ) -> List[Dict]:
+    names = character_class_names(class_names)
     shapes = []
     for point, score, label in zip(points, scores, labels):
         if float(score) < threshold:
             continue
         class_id = int(label)
-        class_name = class_names[class_id] if class_id < len(class_names) else str(class_id)
+        class_name = names[class_id] if class_id < len(names) else str(class_id)
         shapes.append(
             {
                 "label": class_name,
@@ -145,6 +168,7 @@ def build_labelme_json(
     draft_depth: float,
     draft_confidence: float,
     valid_threshold: float,
+    has_depth: bool,
 ) -> Dict:
     all_shapes = list(shapes)
     if waterline_points:
@@ -160,7 +184,7 @@ def build_labelme_json(
         )
     height, width = image_shape
     relative_image = os.path.relpath(image_path.resolve(), json_path.parent.resolve()).replace("\\", "/")
-    return {
+    payload = {
         "version": "5.5.0",
         "flags": {},
         "shapes": all_shapes,
@@ -168,10 +192,17 @@ def build_labelme_json(
         "imageData": None,
         "imageHeight": int(height),
         "imageWidth": int(width),
-        "draft depth": float(draft_depth),
-        "draft_depth_valid": bool(draft_confidence >= valid_threshold),
-        "draft_depth_confidence": float(draft_confidence),
     }
+    if has_depth:
+        payload["draft depth"] = float(draft_depth)
+        payload["draft_depth_valid"] = bool(draft_confidence >= valid_threshold)
+        payload["draft_depth_confidence"] = float(draft_confidence)
+    else:
+        payload["draft depth"] = None
+        payload["draft_depth_valid"] = False
+        payload["draft_depth_confidence"] = 0.0
+        payload["flags"]["stage_without_depth"] = True
+    return payload
 
 
 def draw_visualization(
@@ -180,9 +211,10 @@ def draw_visualization(
     waterline_mask: np.ndarray,
     draft_depth: float,
     draft_confidence: float,
+    has_depth: bool,
 ) -> np.ndarray:
     canvas = image.copy()
-    if waterline_mask.shape == image.shape[:2] and waterline_mask.any():
+    if waterline_mask is not None and waterline_mask.shape == image.shape[:2] and waterline_mask.any():
         overlay = canvas.copy()
         overlay[waterline_mask > 0] = (40, 210, 80)
         canvas = cv2.addWeighted(overlay, 0.3, canvas, 0.7, 0)
@@ -192,6 +224,8 @@ def draw_visualization(
         if shape["label"] == "waterline":
             if len(points) >= 2:
                 cv2.polylines(canvas, [points], False, (30, 240, 70), 2, cv2.LINE_AA)
+            elif len(points) == 1:
+                cv2.circle(canvas, tuple(points[0]), 4, (30, 240, 70), -1, cv2.LINE_AA)
             continue
         x, y = points[0].tolist()
         cv2.circle(canvas, (x, y), 4, (0, 220, 255), -1, cv2.LINE_AA)
@@ -212,7 +246,10 @@ def draw_visualization(
             cv2.LINE_AA,
         )
 
-    text_lines = [f"Draft: {draft_depth:.3f} m", f"Valid: {draft_confidence:.3f}"]
+    if has_depth:
+        text_lines = [f"Draft: {draft_depth:.3f} m", f"Valid: {draft_confidence:.3f}"]
+    else:
+        text_lines = ["Draft: N/A (no depth head)", "Characters + waterline only"]
     base_scale = 0.5
     widest = max(cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, base_scale, 1)[0][0] for line in text_lines)
     font_scale = base_scale * min(1.0, max((canvas.shape[1] - 18) / max(widest, 1), 0.6))
@@ -234,23 +271,70 @@ def draw_visualization(
     return canvas
 
 
-def predict_image(predictor: DraftFormerPredictor, image_path: Path, output_dir: Path, args) -> None:
+def _tensor_to_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if hasattr(value, "detach"):
+        return float(value.detach().cpu().item())
+    return float(value)
+
+
+def predict_image(
+    predictor: DraftFormerPredictor,
+    image_path: Path,
+    output_dir: Path,
+    args,
+    has_depth: bool,
+) -> None:
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"Failed to read image: {image_path}")
     output = predictor(image)
-    points = output["points"].detach().cpu().numpy()
-    scores = output["scores"].detach().cpu().numpy()
-    labels = output["labels"].detach().cpu().numpy()
-    segmentation = output["sem_seg"].detach().cpu().numpy()
-    draft_depth = float(output["draft_depth"].detach().cpu())
-    draft_confidence = float(output["draft_valid"].detach().cpu())
 
-    waterline_points, waterline_mask, waterline_confidence = extract_waterline(
-        segmentation,
-        threshold=args.waterline_thresh,
-        spacing=args.waterline_spacing,
-    )
+    points = output.get("points")
+    scores = output.get("scores")
+    labels = output.get("labels")
+    if points is None:
+        points = np.zeros((0, 2), dtype=np.float32)
+        scores = np.zeros((0,), dtype=np.float32)
+        labels = np.zeros((0,), dtype=np.int64)
+    else:
+        points = points.detach().cpu().numpy()
+        scores = scores.detach().cpu().numpy()
+        labels = labels.detach().cpu().numpy()
+
+    segmentation = output.get("sem_seg")
+    if segmentation is not None:
+        segmentation = segmentation.detach().cpu().numpy()
+    else:
+        segmentation = np.zeros((1, image.shape[0], image.shape[1]), dtype=np.float32)
+
+    draft_depth = _tensor_to_float(output.get("draft_depth"), 0.0)
+    draft_confidence = _tensor_to_float(output.get("draft_valid"), 0.0)
+    if not has_depth:
+        draft_depth = 0.0
+        draft_confidence = 0.0
+
+    if "waterline_points" in output and len(output["waterline_points"]) > 0:
+        wl = output["waterline_points"].detach().cpu().numpy()
+        wl_scores = (
+            output["waterline_scores"].detach().cpu().numpy()
+            if "waterline_scores" in output and len(output.get("waterline_scores", []))
+            else None
+        )
+        waterline_points = [[float(x), float(y)] for x, y in wl]
+        waterline_confidence = float(wl_scores.mean()) if wl_scores is not None and len(wl_scores) else 1.0
+        if segmentation.ndim == 3:
+            waterline_mask = (segmentation[0] > args.waterline_thresh).astype(np.uint8)
+        else:
+            waterline_mask = (segmentation > args.waterline_thresh).astype(np.uint8)
+    else:
+        waterline_points, waterline_mask, waterline_confidence = extract_waterline(
+            segmentation,
+            threshold=args.waterline_thresh,
+            spacing=args.waterline_spacing,
+        )
+
     shapes = character_shapes(
         points,
         scores,
@@ -269,37 +353,95 @@ def predict_image(predictor: DraftFormerPredictor, image_path: Path, output_dir:
         draft_depth=draft_depth,
         draft_confidence=draft_confidence,
         valid_threshold=args.valid_thresh,
+        has_depth=has_depth,
     )
     json_path.write_text(json.dumps(label, ensure_ascii=False, indent=2), encoding="utf-8")
-    visualization = draw_visualization(image, label["shapes"], waterline_mask, draft_depth, draft_confidence)
+    visualization = draw_visualization(
+        image,
+        label["shapes"],
+        waterline_mask,
+        draft_depth,
+        draft_confidence,
+        has_depth=has_depth,
+    )
     visualization_path = output_dir / f"{image_path.stem}_vis.jpg"
     if not cv2.imwrite(str(visualization_path), visualization):
         raise ValueError(f"Failed to write visualization: {visualization_path}")
+
+    draft_msg = f"draft={draft_depth:.3f}m valid={draft_confidence:.3f}" if has_depth else "draft=N/A"
     print(
-        f"{image_path.name}: draft={draft_depth:.3f}m valid={draft_confidence:.3f} "
-        f"characters={len(shapes)} waterline_points={len(waterline_points)}"
+        f"{image_path.name}: {draft_msg} "
+        f"characters={len(shapes)} waterline_points={len(waterline_points)} "
+        f"-> {visualization_path.name}"
     )
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
+    config_path = normalize_user_path(args.config)
+    weights_path = normalize_user_path(args.weights)
+    output_dir = normalize_user_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config not found: {config_path}")
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {weights_path}")
+
     image_files = [Path(path) for path in get_image_files(args.input)]
+    if not image_files:
+        # Try resolving relative to project root.
+        try:
+            image_files = [Path(path) for path in get_image_files(str(normalize_user_path(args.input)))]
+        except Exception:
+            image_files = []
     if not image_files:
         raise ValueError(f"No input images found: {args.input}")
 
+    stems = [path.stem.casefold() for path in image_files]
+    duplicate_stems = sorted({stem for stem in stems if stems.count(stem) > 1})
+    if duplicate_stems:
+        raise ValueError(
+            "Input images would overwrite outputs because they share a filename stem: "
+            + ", ".join(duplicate_stems)
+        )
+    input_paths = {path.resolve() for path in image_files}
+    output_root = output_dir.resolve()
+    if any(path.parent.resolve() == output_root for path in image_files):
+        raise ValueError("Output directory must differ from the input image directory")
+    output_paths = {
+        target.resolve()
+        for path in image_files
+        for target in (output_dir / f"{path.stem}.json", output_dir / f"{path.stem}_vis.jpg")
+    }
+    collisions = sorted(input_paths & output_paths)
+    if collisions:
+        raise ValueError(
+            "Output paths would overwrite input images: " + ", ".join(str(path) for path in collisions)
+        )
+
+    print(f"config : {config_path}")
+    print(f"weights: {weights_path}")
+    print(f"images : {len(image_files)}")
+
     predictor = DraftFormerPredictor(
-        config_file=args.config,
-        weights_path=args.weights,
+        config_file=str(config_path),
+        weights_path=str(weights_path),
         device=args.device,
         opts={
             "Architecture": {"return_auxiliary_outputs": True},
-            "PostProcess": {"score_thresh": args.score_thresh},
+            "PostProcess": {
+                "score_thresh": args.score_thresh,
+                "waterline_score_thresh": args.waterline_thresh,
+            },
         },
     )
+    # Whether this checkpoint/config has a draft head is detected from the model.
+    has_depth = getattr(predictor.model, "direct_depth_head", None) is not None
+    print(f"has_depth_head: {has_depth}")
+
     for image_path in image_files:
-        predict_image(predictor, image_path, output_dir, args)
+        predict_image(predictor, image_path, output_dir, args, has_depth=has_depth)
 
 
 if __name__ == "__main__":

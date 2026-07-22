@@ -14,12 +14,10 @@ from shipdraft_mtl.engine.trainer import Trainer
 
 def parse_args():
     parser = ArgsParser()
-    parser.add_argument(
-        "--eval",
-        action="store_true",
-        default=True,
-        help="Whether to perform evaluation during training.",
-    )
+    eval_group = parser.add_mutually_exclusive_group()
+    eval_group.add_argument("--eval", dest="eval", action="store_true", help="Enable evaluation.")
+    eval_group.add_argument("--no-eval", dest="eval", action="store_false", help="Disable evaluation.")
+    parser.set_defaults(eval=True)
     args = parser.parse_args()
     return args
 

@@ -1,0 +1,54 @@
+# Stage 3 (optional): joint fine-tune of character + waterline + draft depth at low LR.
+# Best checkpoint selected by hybrid_score with draft-primary weights (0.2/0.2/0.6).
+_BASE_: default_e2e.yml
+
+Global:
+  epoch_num: 50
+  output_dir: ./outputs/shipdraft_mtl/stage3_joint
+  checkpoints:
+  # Load stage-2 (preferred) or stage-1+random depth if you skipped stage 2.
+  pretrained_model: ./outputs/shipdraft_mtl/stage2_depth/best.pth
+
+Optimizer:
+  lr: 0.00002
+  backbone_lr_mult: 0.1
+
+LRScheduler:
+  milestones: [15, 25]
+  gamma: 0.5
+  warmup_epoch: 0
+
+Architecture:
+  DirectDepth:
+    enabled: True
+    num_character_queries: 80
+
+TaskTrain:
+  stage: stage3_joint
+  train_character: True
+  train_waterline: True
+  train_depth: True
+  train_structure: True
+  freeze:
+    backbone: False
+    encoder: False
+    decoder: False
+    head: False
+    direct_depth_head: False
+
+Metric:
+  # Joint score, draft-primary.
+  main_indicator: hybrid_score
+  evaluate_character: True
+  evaluate_waterline: True
+  evaluate_depth: True
+  pck_threshold: 0.02
+  curve_y_score_ref_px: 8.0
+  hybrid_char_metric: char_score
+  hybrid_waterline_metric: waterline_score
+  hybrid_draft_metric: draft_score
+  hybrid_char_weight: 0.2
+  hybrid_waterline_weight: 0.2
+  hybrid_draft_weight: 0.6
+  hybrid_det_weight: 0.2
+  hybrid_seg_weight: 0.2

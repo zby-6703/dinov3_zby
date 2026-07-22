@@ -1,0 +1,55 @@
+# Stage 2: freeze perception, train draft-depth head only.
+# Best checkpoint selected by draft_score = 1 / (1 + MADDE)
+_BASE_: default_e2e.yml
+
+Global:
+  epoch_num: 100
+  output_dir: ./outputs/shipdraft_mtl/stage2_depth
+  checkpoints:
+  # IMPORTANT: point this to stage-1 best/latest checkpoint.
+  pretrained_model: ./outputs/shipdraft_mtl/stage1_keypoints/best.pth
+
+Optimizer:
+  # Depth-only head can use a slightly higher LR.
+  lr: 0.0002
+  backbone_lr_mult: 0.0
+
+LRScheduler:
+  milestones: [25, 35]
+  gamma: 0.1
+  warmup_epoch: 1
+
+Architecture:
+  DirectDepth:
+    enabled: True
+    num_character_queries: 80
+  # Keep auxiliary outputs on eval so optional point diagnostics still work.
+  return_auxiliary_outputs: False
+
+Eval:
+  return_auxiliary_outputs: True
+
+TaskTrain:
+  stage: stage2_depth
+  train_character: False
+  train_waterline: False
+  train_depth: True
+  train_structure: False
+  freeze:
+    backbone: True
+    encoder: True
+    decoder: True
+    head: True
+    direct_depth_head: False
+
+Metric:
+  # Only draft reading accuracy decides best.pth
+  main_indicator: draft_score
+  evaluate_character: False
+  evaluate_waterline: False
+  evaluate_depth: True
+  hybrid_char_weight: 0.0
+  hybrid_waterline_weight: 0.0
+  hybrid_draft_weight: 1.0
+  hybrid_det_weight: 0.0
+  hybrid_seg_weight: 0.0

@@ -9,6 +9,7 @@ This mirrors the ShipNameRecognition/OpenOCR style:
 from __future__ import annotations
 
 import os
+import ntpath
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from collections.abc import Mapping
 
@@ -30,7 +31,7 @@ def parse_override_options(opts):
     for item in opts:
         item = item.strip()
         key, value = item.split("=", 1)
-        value = yaml.load(value, Loader=yaml.Loader)
+        value = yaml.safe_load(value)
         cur = config
         parts = key.split(".")
         for part in parts[:-1]:
@@ -49,7 +50,8 @@ class ArgsParser(ArgumentParser):
 
     def parse_args(self, argv=None):
         args = super().parse_args(argv)
-        assert args.config is not None, "Please specify --config=configure_file_path."
+        if args.config is None:
+            self.error("Please specify --config=configure_file_path.")
         args.opt = self._parse_opt(args.opt)
         return args
 
@@ -134,31 +136,42 @@ def print_dict(cfg, print_func=print, delimiter=0):
 class Config:
     def __init__(self, config_path, BASE_KEY="_BASE_"):
         self.BASE_KEY = BASE_KEY
-        self.cfg = ConfigDict(self._load_config_with_base(config_path))
+        self.cfg = ConfigDict(self._load_config_with_base(config_path, loading=set()))
 
-    def _load_config_with_base(self, file_path):
+    def _load_config_with_base(self, file_path, loading):
+        file_path = os.path.abspath(os.path.expanduser(os.fspath(file_path)))
+        canonical_path = os.path.normcase(file_path)
+        if canonical_path in loading:
+            raise ValueError(f"Cyclic _BASE_ configuration detected at: {file_path}")
         _, ext = os.path.splitext(file_path)
-        assert ext in [".yml", ".yaml"], "only support yaml files for now"
+        if ext.lower() not in [".yml", ".yaml"]:
+            raise ValueError(f"Only YAML configuration files are supported: {file_path}")
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            file_cfg = yaml.load(f, Loader=yaml.Loader) or {}
+        loading.add(canonical_path)
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                file_cfg = yaml.safe_load(f) or {}
+            if not isinstance(file_cfg, Mapping):
+                raise ValueError(f"Configuration root must be a mapping: {file_path}")
 
-        if self.BASE_KEY in file_cfg:
-            all_base_cfg = {}
-            base_value = file_cfg[self.BASE_KEY]
-            base_ymls = [base_value] if isinstance(base_value, str) else list(base_value)
-            for base_yml in base_ymls:
-                if base_yml.startswith("~"):
-                    base_yml = os.path.expanduser(base_yml)
-                if not base_yml.startswith("/"):
-                    base_yml = os.path.join(os.path.dirname(file_path), base_yml)
-                base_cfg = self._load_config_with_base(base_yml)
-                all_base_cfg = _merge_dict(all_base_cfg, base_cfg)
-            del file_cfg[self.BASE_KEY]
-            file_cfg = _merge_dict(all_base_cfg, file_cfg)
+            if self.BASE_KEY in file_cfg:
+                all_base_cfg = {}
+                base_value = file_cfg[self.BASE_KEY]
+                base_ymls = [base_value] if isinstance(base_value, str) else list(base_value)
+                for base_yml in base_ymls:
+                    base_yml = os.path.expanduser(os.fspath(base_yml))
+                    # ntpath handles drive-letter and UNC paths even when parsing on POSIX.
+                    if not (os.path.isabs(base_yml) or ntpath.isabs(base_yml)):
+                        base_yml = os.path.join(os.path.dirname(file_path), base_yml)
+                    base_cfg = self._load_config_with_base(base_yml, loading)
+                    all_base_cfg = _merge_dict(all_base_cfg, base_cfg)
+                del file_cfg[self.BASE_KEY]
+                file_cfg = _merge_dict(all_base_cfg, file_cfg)
 
-        file_cfg["filename"] = os.path.splitext(os.path.split(file_path)[-1])[0]
-        return file_cfg
+            file_cfg["filename"] = os.path.splitext(os.path.split(file_path)[-1])[0]
+            return file_cfg
+        finally:
+            loading.remove(canonical_path)
 
     def merge_dict(self, args):
         self.cfg = ConfigDict(_merge_dict(self.cfg, args))

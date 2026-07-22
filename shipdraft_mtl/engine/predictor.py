@@ -125,6 +125,10 @@ class DraftFormerPredictor:
                 "DraftFormer HybridBackboneV2 currently requires CUDA for vmamba-backed operators. "
                 "Use device='cuda' for inference with this backbone."
             )
+        # Inference always needs character/waterline auxiliaries when available.
+        arch = self.cfg.setdefault("Architecture", {})
+        arch["return_auxiliary_outputs"] = True
+
         self.model = build_model(self.cfg).to(self.device)
         weights = (
             weights_path
@@ -132,24 +136,34 @@ class DraftFormerPredictor:
             or self.cfg["Global"].get("checkpoints")
         )
         if weights:
+            # Normalize Windows paths so "\best.pth" is not corrupted by "\b".
+            weights = str(weights).replace("\\", "/")
+            if not os.path.isfile(weights):
+                raise FileNotFoundError(f"Checkpoint not found: {weights}")
             load_pretrained_params(self.model, weights, logger)
         self.model.eval()
+        # Ensure runtime flag is on even if config merge was shallow.
+        self.model.return_auxiliary_outputs = True
 
         self.input_size = tuple(
             self.cfg.get("Input", {}).get(
                 "image_size",
-                self.cfg["Train"]["dataset"].get("image_size", [256, 640]),
+                self.cfg.get("Train", {}).get("dataset", {}).get("image_size", [256, 640]),
             )
         )
         self.image_format = self.cfg.get("Input", {}).get(
             "format",
-            self.cfg["Train"]["dataset"].get("image_format", "BGR"),
+            self.cfg.get("Train", {}).get("dataset", {}).get("image_format", "BGR"),
         )
         self.class_names = list(self.cfg.get("Metric", {}).get("det_class_names", []))
         if not self.class_names:
             self.class_names = list(self.cfg.get("Data", {}).get("detection_classes", []))
+        # Character prediction ignores the waterline pseudo-class if present.
+        self.class_names = [name for name in self.class_names if str(name).lower() != "waterline"]
         if not self.class_names:
-            raise ValueError("No detection class names in Metric.det_class_names or Data.detection_classes")
+            # Fallback for stage configs that rely on dataset metadata at train time.
+            self.class_names = ["0", "1", "2", "3", "4", "5", "6", "8", "M"]
+            logger.warning("Metric.det_class_names empty; using default digit classes %s", self.class_names)
 
     def preprocess(self, image: np.ndarray) -> Dict:
         orig_h, orig_w = image.shape[:2]
